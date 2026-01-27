@@ -10,22 +10,23 @@ Original file is located at
 a571566d8d174e52974a00c86f946dc6
 """
 
-# -*- coding: utf-8 -*-
-"""
-EDINET（優先） + TDNet（補完）でBSデータを埋める（テスト用：上から50社だけ）
+# # -*- coding: utf-8 -*-
+# """
+# EDINET（優先） + TDNet（補完）でBSデータを埋める（テスト用：上から50社だけ）
+#
+# v24.11:
+# - robot home のように「SSR/QSRの prior が年度末(期末)を指すが、その年度末ASRがDAYS_BACK外で拾えない」
+#   -> SSR/QSRの prior が年度末 かつ period_end が EDINET走査開始日より前 の場合だけ
+#      period_end+30〜+200日を追加探索して ASR を拾い、storeに追加（ASRが優先される）
+#   -> これで CP/DB のリース債務省略による誤警告を回避
+#
+# 従来仕様
+# - 空欄セルのみ入力（上書きしない）
+# - 入力したセルは黄色
+# - 既存値と新値の差が abs(diff) > 1 のセルのみ橙色（警告）
+# - EE列に「懸念check」列：行内に橙色が1つでもあれば 1
+# """
 
-v24.11:
-- robot home のように「SSR/QSRの prior が年度末(期末)を指すが、その年度末ASRがDAYS_BACK外で拾えない」
-  -> SSR/QSRの prior が年度末 かつ period_end が EDINET走査開始日より前 の場合だけ
-     period_end+30〜+200日を追加探索して ASR を拾い、storeに追加（ASRが優先される）
-  -> これで CP/DB のリース債務省略による誤警告を回避
-
-従来仕様
-- 空欄セルのみ入力（上書きしない）
-- 入力したセルは黄色
-- 既存値と新値の差が abs(diff) > 1 のセルのみ橙色（警告）
-- EE列に「懸念check」列：行内に橙色が1つでもあれば 1
-"""
 
 from __future__ import annotations
 
@@ -56,7 +57,7 @@ from openpyxl.utils import column_index_from_string
 EDINET_API_KEY = os.environ.get("EDINET_API_KEY", "").strip()
 
 INPUT_XLSX = "データ取得_BS.xlsx"
-OUTPUT_XLSX = "データ取得_BS_EDINET優先_TDNet補完_テスト50社_v24_11.xlsx"
+OUTPUT_XLSX = "データ取得_BS_EDINET優先_TDNet補完_テスト50社_v26_01.xlsx"
 
 MAX_ROWS = 50   # テスト（上から50社）。全社は None
 
@@ -225,6 +226,11 @@ ST_BORROWINGS_DIRECT_CONCEPTS = [
     "jppfs_cor:ShortTermBorrowingsSummaryOfBusinessResults",
     "us-gaap:ShortTermBorrowings",
 ]
+
+ST_BORROWINGS_TOTAL_ONLY_CONCEPTS = [
+    "jppfs_cor:ShortTermBorrowings",
+    "us-gaap:ShortTermBorrowings",
+]
 ST_BORROWINGS_CURRENT_PORTION_CONCEPTS = [
     "jppfs_cor:CurrentPortionOfLongTermLoansPayable",
     "jppfs_cor:CurrentPortionOfLongTermBorrowings",
@@ -287,13 +293,26 @@ _ST_RELATED_LOANS_LOCAL_RE = re.compile(
 )
 
 def _scan_related_st_loans_yen(v_full, ctx: str) -> Optional[int]:
-    """Sum related-party short-term loans payable if they exist as separate concepts."""
+    """Sum related-party short-term loans payable if they exist as separate concepts.
+
+    NOTE: iXBRL and XBRL sometimes provide the same concept twice (prefixed vs unprefixed name).
+    Deduplicate by local-name to avoid double count (typical regression: +50m for related-party loans).
+    """
     if not ctx:
         return None
-    v = scan_sum_by_localname(v_full, ctx, lambda ln: bool(_ST_RELATED_LOANS_LOCAL_RE.search(ln)))
-    if v is None:
-        return None
-    return int(v)
+    seen = set()
+    vals = []
+    for (name, c), v in v_full.items():
+        if c != ctx or v is None:
+            continue
+        ln = local_name(name)
+        if not _ST_RELATED_LOANS_LOCAL_RE.search(ln):
+            continue
+        if ln in seen:
+            continue
+        seen.add(ln)
+        vals.append(int(v))
+    return int(sum(vals)) if vals else None
 
 SHARES_CONCEPTS = [
     "jppfs_cor:NumberOfIssuedSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
@@ -331,33 +350,43 @@ def local_name(concept: str) -> str:
 
 
 def parse_date_any(s: object) -> Optional[dt.date]:
+    # v24.11 安定版：period_end の誤パースは四半期マッピング崩れ→誤警告の最大要因なので堅めに。
     if s is None:
         return None
     t = str(s).strip()
     if not t:
         return None
+
+    # 1) ISO / "YYYY-MM-DD..." (EDINET/TDNetで最頻)
     try:
         return dt.date.fromisoformat(t[:10])
     except Exception:
         pass
+
+    # 2) "YYYY/MM/DD" / "YYYY-MM-DD"
     m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", t)
     if m:
         try:
             return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except Exception:
             return None
-    m = re.search(r"(\d{44})(\d{2})(\d{2})", t)
+
+    # 3) "YYYYMMDD"（8桁）
+    m = re.search(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)", t)
     if m:
         try:
             return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except Exception:
             return None
+
+    # 4) "YYYY年M月D日"
     m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", t)
     if m:
         try:
             return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except Exception:
             return None
+
     return None
 
 
@@ -734,8 +763,17 @@ def extract_debt_components_xbrl(v_full, v_local, ctx: Optional[str]) -> dict:
 
     cur_port = first_value(v_full, v_local, ST_BORROWINGS_CURRENT_PORTION_CONCEPTS, ctx)
 
-    # Main short-term borrowing concept (do NOT sum alternatives to avoid double count)
-    st_direct = first_value(v_full, v_local, ST_BORROWINGS_DIRECT_CONCEPTS, ctx)
+    # Main short-term borrowing concept:
+    # - If ShortTermBorrowings is tagged, treat it as TOTAL (do not add related-party breakdown).
+    # - Otherwise fall back to ShortTermLoansPayable etc, where related-party may be a separate line item.
+    st_total_like = first_value(v_full, v_local, ST_BORROWINGS_TOTAL_ONLY_CONCEPTS, ctx)
+    st_direct = st_total_like
+    st_direct_is_total = (st_total_like is not None)
+    if st_direct is None:
+        st_direct = first_value(v_full, v_local, [
+            "jppfs_cor:ShortTermLoansPayable",
+            "jppfs_cor:ShortTermBorrowingsSummaryOfBusinessResults",
+        ], ctx)
 
     # Related-party short-term loans are often tagged separately (e.g., Chugai Mining)
     st_related = _scan_related_st_loans_yen(v_full, ctx)
@@ -749,7 +787,16 @@ def extract_debt_components_xbrl(v_full, v_local, ctx: Optional[str]) -> dict:
     else:
         # No total -> build from components.
         # Add related-party ST loans *as separate line item* when present.
-        loans_cl = sum_nullable(st_direct, cur_port, st_related)
+        # v24.11方針：総額（ShortTermBorrowings等）がある文脈では内訳（related-party）を足さない（重複防止）
+        if st_direct is None:
+            loans_cl = sum_nullable(st_direct, cur_port, st_related)
+        else:
+            # If st_direct is TOTAL (ShortTermBorrowings), related-party is usually breakdown -> do not add.
+            # If st_direct is ShortTermLoansPayable etc, related-party may be separate line item -> add.
+            if st_direct_is_total:
+                loans_cl = sum_nullable(st_direct, cur_port)
+            else:
+                loans_cl = sum_nullable(st_direct, cur_port, st_related)
 
     total_ncl = first_value(v_full, v_local, BORROWINGS_NCL_TOTAL_CONCEPTS, ctx)
     if total_ncl is not None:
@@ -817,13 +864,32 @@ def pick_best_debt_context(
     v_full,
     v_local,
 ) -> Optional[str]:
+    # 回帰対策：まず BS primary_ctx を優先し、明確に不正な場合のみ同日別ctxへフォールバックする。
     if not target_date:
         return primary_ctx
 
+    def _is_sane(cid: Optional[str]) -> bool:
+        if not cid:
+            return False
+        info = ctx_info.get(cid) or {}
+        if info.get("type") != "instant" or info.get("instant_date") != target_date:
+            return False
+        comps = _debt_components(v_full, v_local, cid)
+        st = comps.get("st")
+        if st is None or st < 0:
+            return False
+        cur_liab = first_value(v_full, v_local, BS_FIELDS["current_liabilities"], cid)
+        if cur_liab is not None and st > cur_liab + DEBT_SANITY_MARGIN_YEN:
+            return False
+        return True
+
+    # 1) primary_ctx が同日のinstantで妥当ならそれを採用
+    if _is_sane(primary_ctx):
+        return primary_ctx
+
+    # 2) 同日候補からスコアで選ぶ
     candidates = [cid for cid, info in ctx_info.items()
                   if info.get("type") == "instant" and info.get("instant_date") == target_date]
-    if primary_ctx and primary_ctx not in candidates:
-        candidates.insert(0, primary_ctx)
     if not candidates:
         return primary_ctx
 
@@ -831,23 +897,19 @@ def pick_best_debt_context(
     best_score = None
 
     for cid in candidates:
-        comps = _debt_components(v_full, v_local, cid)
-        st = comps.get("st")
-        if st is None or st < 0:
+        if not _is_sane(cid):
             continue
 
-        cur_liab = first_value(v_full, v_local, BS_FIELDS["current_liabilities"], cid)
-        if cur_liab is not None and st > cur_liab + DEBT_SANITY_MARGIN_YEN:
-            continue
+        comps = _debt_components(v_full, v_local, cid)
+        st = int(comps.get("st") or 0)
 
         low = (cid or "").lower()
         not_noncon = 1 if "nonconsolidated" not in low else 0
         has_con = 1 if ("consolidated" in low and "nonconsolidated" not in low) else 0
         no_member = 1 if "member" not in low else 0
         comp_cnt = int(comps.get("component_count") or 0)
-        st_val = int(st)
 
-        score = (has_con, not_noncon, no_member, comp_cnt, st_val)
+        score = (has_con, not_noncon, no_member, comp_cnt, st)
 
         if best is None or score > best_score:
             best = cid
@@ -1030,7 +1092,7 @@ def extract_debt_schedules_from_html(html: str) -> List[dict]:
                 continue
 
             if "短期借入" in label:
-                st_end["short_loan"] = v_end
+                st_end["short_loan"] = int(st_end.get("short_loan") or 0) + int(v_end)
                 continue
 
             if _LEASE_RE.search(label):
@@ -1482,6 +1544,10 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
     prior_ctx_debt = pick_best_debt_context(prior_d, prior_ctx, ctx_info, v_full, v_local)
     cur_ctx_debt   = pick_best_debt_context(cur_d, cur_ctx, ctx_info, v_full, v_local)
 
+    # log用（WARN時に追えるように）
+    out["debt_ctx_prior"] = prior_ctx_debt
+    out["debt_ctx_current"] = cur_ctx_debt
+
     # debt components for each suffix (for rescue判断)
     for suffix, dctx in [("prior", prior_ctx_debt), ("current", cur_ctx_debt)]:
         comps = extract_debt_components_xbrl(v_full, v_local, dctx)
@@ -1645,6 +1711,8 @@ def scrape_tdnet_bs(target_tickers: set[str], days_back: int = 35, sleep_sec: fl
                     "long_term_borrowings": yen_to_million_3dp(extracted.get(f"long_term_borrowings_{suffix}")),
                     "income_taxes_payable": yen_to_million_3dp(extracted.get(f"income_taxes_payable_{suffix}")),
                     "shares_outstanding": extracted.get(f"shares_outstanding_{suffix}"),
+        "debt_ctx": extracted.get(f"debt_ctx_{suffix}"),
+                    "debt_ctx": extracted.get(f"debt_ctx_{suffix}"),
                 }
                 rec["_completeness"] = completeness_score(rec)
 
@@ -1736,6 +1804,7 @@ def _build_edinet_record_from_extracted(
         "long_term_borrowings": yen_to_million_3dp(extracted.get(f"long_term_borrowings_{suffix}")),
         "income_taxes_payable": yen_to_million_3dp(extracted.get(f"income_taxes_payable_{suffix}")),
         "shares_outstanding": extracted.get(f"shares_outstanding_{suffix}"),
+        "debt_ctx": extracted.get(f"debt_ctx_{suffix}"),
     }
     rec_out["_completeness"] = completeness_score(rec_out)
     return rec_out
@@ -2051,11 +2120,15 @@ def fill_excel_from_store(
         "income_taxes_payable": col_tax,
     }
 
+    # 仕様変更：EE列「懸念check」は“直近5四半期”の橙色セル有無で判定する
+    sorted_fyq = sorted(date_cols.keys())
+    last5_fyq = set(sorted_fyq[-5:]) if len(sorted_fyq) >= 5 else set(sorted_fyq)
+
     warnings: List[str] = []
     filled = 0
     compared = 0
     warn_cells = 0
-    row_has_warning: Dict[int, bool] = defaultdict(bool)
+    row_has_warning_last5: Dict[int, bool] = defaultdict(bool)
 
     for row in rows_to_process:
         code_v = ws.cell(row, 1).value
@@ -2115,13 +2188,15 @@ def fill_excel_from_store(
                     if diff > warn_tolerance:
                         cell.fill = ORANGE
                         warn_cells += 1
-                        row_has_warning[row] = True
+                        in_last5 = (fy, q) in last5_fyq
+                        if in_last5:
+                            row_has_warning_last5[row] = True
                         warnings.append(
-                            f"WARN {code4} R{row} C{col} existing={old_val} new={new_val} diff={diff} "
-                            f"(period_end={period_end.isoformat()}, as_of={rec.get('as_of')}, source={rec.get('source')}, doc_kind={rec.get('doc_kind')}, suffix={rec.get('suffix')}, title={rec.get('title','')})"
+                            f"WARN {code4} R{row} C{col} field={field} fyq={fy}Q{q} in_last5={in_last5} existing={old_val} new={new_val} diff={diff} "
+                            f"(period_end={period_end.isoformat()}, as_of={rec.get('as_of')}, source={rec.get('source')}, doc_kind={rec.get('doc_kind')}, suffix={rec.get('suffix')}, debt_ctx={rec.get('debt_ctx')}, title={rec.get('title','')})"
                         )
 
-        ws.cell(row, CHECK_COL).value = 1 if row_has_warning.get(row, False) else ""
+        ws.cell(row, CHECK_COL).value = 1 if row_has_warning_last5.get(row, False) else ""
 
     wb.save(output_xlsx)
 
