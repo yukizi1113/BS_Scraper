@@ -54,7 +54,7 @@ from openpyxl.utils import column_index_from_string
 EDINET_API_KEY = os.environ.get("EDINET_API_KEY", "").strip()
 
 INPUT_XLSX = "データ取得_BS.xlsx"
-OUTPUT_XLSX = "データ取得_BS_EDINET優先_TDNet補完_テスト100社_v26_06.xlsx"
+OUTPUT_XLSX = "データ取得_BS_EDINET優先_TDNet補完_テスト100社_v26_10.xlsx"
 
 MAX_ROWS = 100   # テスト（上から50社）。全社は None
 
@@ -310,6 +310,62 @@ def _scan_related_st_loans_yen(v_full, ctx: str) -> Optional[int]:
         seen.add(ln)
         vals.append(int(v))
     return int(sum(vals)) if vals else None
+
+# Non-recourse components (various issuers use different local-names, e.g. Obayashi:
+#   - CurrentPortionOfNonrecourseLoansCL (short-term bucket)
+#   - NonrecourseLoansNCL (long-term bucket)
+# Keep patterns conservative and case-insensitive; dedupe happens by local-name.
+_NR_ST_LOANS_LOCAL_RE = re.compile(
+    r"("
+    r"CurrentPortionOfNonrecourseLoansCL|"
+    r"CurrentPortionOfNonRecourseLoansCL|"
+    r"CurrentPortionOfNonrecourseLoans|"
+    r"Nonrecourse.*LoansCL|NonRecourse.*LoansCL|"
+    r"ShortTerm.*NonRecourse.*LoansPayable|NonRecourse.*ShortTerm.*LoansPayable|"
+    r"ShortTermNonRecourseBorrowings|NonRecourseShortTermBorrowings"
+    r")",
+    re.IGNORECASE,
+)
+_NR_LT_LOANS_LOCAL_RE = re.compile(
+    r"("
+    r"NonrecourseLoansNCL|NonRecourseLoansNCL|"
+    r"Nonrecourse.*LoansNCL|NonRecourse.*LoansNCL|"
+    r"LongTerm.*NonRecourse.*LoansPayable|NonRecourse.*LongTerm.*LoansPayable"
+    r")",
+    re.IGNORECASE,
+)
+# Exclude Current/CL portions to avoid mixing with short-term buckets.
+_NR_LT_BONDS_LOCAL_RE = re.compile(
+    r"(NonRecourse.*BondsPayable(?!.*Current)|BondsPayable.*NonRecourse(?!.*Current))",
+    re.IGNORECASE,
+)
+
+def _scan_nonrecourse_components_yen(v_full, ctx: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Scan non-recourse components in the given context (yen units).
+
+    Returns (nr_st_loans, nr_lt_loans, nr_lt_bonds).
+    Deduplicate by local-name to avoid double counting (prefixed vs unprefixed QName).
+    """
+    if not ctx:
+        return None, None, None
+
+    def _sum(pat: re.Pattern) -> Optional[int]:
+        seen = set()
+        vals = []
+        for (name, c), v in v_full.items():
+            if c != ctx or v is None:
+                continue
+            ln = local_name(name)
+            if not pat.search(ln):
+                continue
+            if ln in seen:
+                continue
+            seen.add(ln)
+            vals.append(int(v))
+        return int(sum(vals)) if vals else None
+
+    return _sum(_NR_ST_LOANS_LOCAL_RE), _sum(_NR_LT_LOANS_LOCAL_RE), _sum(_NR_LT_BONDS_LOCAL_RE)
+
 
 SHARES_CONCEPTS = [
     "jppfs_cor:NumberOfIssuedSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
@@ -1144,6 +1200,7 @@ def extract_debt_schedules_from_html(html: str) -> List[dict]:
     return out[:30]
 
 _BOND_TABLE_HINT_RE = re.compile(r"(社債|転換社債|新株予約権付社債|CB|Bonds?)", re.IGNORECASE)
+_BOND_MATURITY_HDR_RE = re.compile(r"(当期末残高|期末残高|残高|償還|期限|年限|Maturity|Due)", re.IGNORECASE)
 
 def extract_bond_maturity_1y_from_html(html: str) -> List[dict]:
     out = []
@@ -1573,6 +1630,10 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
     # debt components for each suffix (for rescue判断)
     for suffix, dctx in [("prior", prior_ctx_debt), ("current", cur_ctx_debt)]:
         comps = extract_debt_components_xbrl(v_full, v_local, dctx)
+        nr_st, nr_lt_loan, nr_lt_bond = _scan_nonrecourse_components_yen(v_full, dctx or "")
+        out[f"nr_st_loans_{suffix}"] = nr_st
+        out[f"nr_lt_loans_{suffix}"] = nr_lt_loan
+        out[f"nr_lt_bonds_{suffix}"] = nr_lt_bond
         for k in ["loans_cl", "bonds_cl", "cp_cl", "lease_cl", "st_total", "loans_ncl", "bonds_ncl", "lease_ncl", "lt_total"]:
             out[f"{k}_{suffix}"] = comps.get(k)
 
@@ -1588,6 +1649,20 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
     if doc_kind == "ASR" and html_candidates and cur_ctx_debt:
         _apply_html_additive_adjustment_for_asr(out, v_full, v_local, cur_ctx_debt, html_candidates)
 
+    
+
+    # Non-recourse alt totals (used only for comparison to existing Excel; base behavior unchanged)
+    for suffix in ("prior", "current"):
+        base_st = out.get(f"short_term_borrowings_{suffix}")
+        base_lt = out.get(f"long_term_borrowings_{suffix}")
+        nr_st = int(out.get(f"nr_st_loans_{suffix}") or 0)
+        nr_lt = int(out.get(f"nr_lt_loans_{suffix}") or 0) + int(out.get(f"nr_lt_bonds_{suffix}") or 0)
+
+        # Build optional "alt" variants by adding non-recourse components.
+        # IMPORTANT: Keep base values untouched to avoid regressions; alt is used ONLY for warning comparison.
+        # Do NOT gate on presence of total concepts (some issuers' totals exclude non-recourse lines).
+        out[f"short_term_borrowings_alt_{suffix}"] = (int(base_st) + int(nr_st)) if (base_st is not None and nr_st) else base_st
+        out[f"long_term_borrowings_alt_{suffix}"] = (int(base_lt) + int(nr_lt)) if (base_lt is not None and nr_lt) else base_lt
     return out
 
 
@@ -1730,7 +1805,9 @@ def scrape_tdnet_bs(target_tickers: set[str], days_back: int = 35, sleep_sec: fl
                     "cash_eq_st_invest": yen_to_million_3dp(extracted.get(f"cash_eq_st_invest_{suffix}")),
                     "current_liabilities": yen_to_million_3dp(extracted.get(f"current_liabilities_{suffix}")),
                     "short_term_borrowings": yen_to_million_3dp(extracted.get(f"short_term_borrowings_{suffix}")),
+        "short_term_borrowings_alt": yen_to_million_3dp(extracted.get(f"short_term_borrowings_alt_{suffix}")),
                     "long_term_borrowings": yen_to_million_3dp(extracted.get(f"long_term_borrowings_{suffix}")),
+        "long_term_borrowings_alt": yen_to_million_3dp(extracted.get(f"long_term_borrowings_alt_{suffix}")),
                     "income_taxes_payable": yen_to_million_3dp(extracted.get(f"income_taxes_payable_{suffix}")),
                     "shares_outstanding": extracted.get(f"shares_outstanding_{suffix}"),
         "debt_ctx": extracted.get(f"debt_ctx_{suffix}"),
@@ -1823,7 +1900,9 @@ def _build_edinet_record_from_extracted(
         "cash_eq_st_invest": yen_to_million_3dp(extracted.get(f"cash_eq_st_invest_{suffix}")),
         "current_liabilities": yen_to_million_3dp(extracted.get(f"current_liabilities_{suffix}")),
         "short_term_borrowings": yen_to_million_3dp(extracted.get(f"short_term_borrowings_{suffix}")),
+        "short_term_borrowings_alt": yen_to_million_3dp(extracted.get(f"short_term_borrowings_alt_{suffix}")),
         "long_term_borrowings": yen_to_million_3dp(extracted.get(f"long_term_borrowings_{suffix}")),
+        "long_term_borrowings_alt": yen_to_million_3dp(extracted.get(f"long_term_borrowings_alt_{suffix}")),
         "income_taxes_payable": yen_to_million_3dp(extracted.get(f"income_taxes_payable_{suffix}")),
         "shares_outstanding": extracted.get(f"shares_outstanding_{suffix}"),
         "debt_ctx": extracted.get(f"debt_ctx_{suffix}"),
@@ -1998,11 +2077,23 @@ def scrape_edinet_bs(target_tickers: set[str], days_back: int, api_key: str, sle
                     store[code4][d] = rec_out
 
                 # ★v24.11 rescue:
-                # SSR/QSRの prior が年度末(期末)で、かつその期末が走査開始日より前なら、ASRをオンデマンド探索して追加
+                # SSR/QSRの prior が「直前の年度末」を指していて、ASRがstoreに無い場合だけオンデマンド探索して追加
                 if dk in ("SSR", "QSR") and suffix == "prior":
+                    # 1) DEIからFY期末月が取れるならそれを優先
                     fy_end_month = extracted.get("fy_end_month")
-                    if isinstance(fy_end_month, int) and d.month == fy_end_month and d < scan_start:
-                        _ensure_asr_for_period_end_if_needed(store, code4=code4, period_end=d, api_key=api_key)
+                    cur_bs_d = parse_date_any(extracted.get("bs_current_date")) if extracted.get("bs_current_date") else None
+
+                    looks_like_fy_end = False
+                    if isinstance(fy_end_month, int) and d.month == fy_end_month:
+                        looks_like_fy_end = True
+                    # 2) DEIが無い/取れない場合：prior日付が月末で、かつcurrent月と異なるなら「年度末」の可能性が高い
+                    elif cur_bs_d and d.day >= 28 and d.month != cur_bs_d.month:
+                        looks_like_fy_end = True
+
+                    if looks_like_fy_end:
+                        prev2 = store[code4].get(d)
+                        if not (prev2 and prev2.get("doc_kind") == "ASR"):
+                            _ensure_asr_for_period_end_if_needed(store, code4=code4, period_end=d, api_key=api_key)
 
     return store
 
@@ -2202,9 +2293,27 @@ def fill_excel_from_store(
                     filled += 1
                 else:
                     old_d = to_decimal_safe(old_val)
-                    new_d = to_decimal_safe(new_val)
-                    if old_d is None or new_d is None:
+                    if old_d is None:
                         continue
+
+                    # For debt fields, also try a non-recourse-augmented alternative.
+                    # This does NOT change what we write (we never overwrite existing cells);
+                    # it only affects warning comparison to avoid false positives.
+                    chosen_variant = "base"
+                    base_val = new_val
+                    alt_val = rec.get(f"{field}_alt") if field in {"short_term_borrowings", "long_term_borrowings"} else None
+                    if alt_val not in (None, ""):
+                        base_d = to_decimal_safe(base_val)
+                        alt_d = to_decimal_safe(alt_val)
+                        if base_d is not None and alt_d is not None:
+                            if (old_d - alt_d).copy_abs() < (old_d - base_d).copy_abs():
+                                new_val = alt_val
+                                chosen_variant = "nonrecourse_add"
+
+                    new_d = to_decimal_safe(new_val)
+                    if new_d is None:
+                        continue
+
                     compared += 1
                     diff = (old_d - new_d).copy_abs()
                     if diff > warn_tolerance:
@@ -2213,8 +2322,11 @@ def fill_excel_from_store(
                         in_last5 = (fy, q) in last5_fyq
                         if in_last5:
                             row_has_warning_last5[row] = True
+                        variant_info = ""
+                        if alt_val not in (None, ""):
+                            variant_info = f" variant={chosen_variant} base={base_val} alt={alt_val}"
                         warnings.append(
-                            f"WARN {code4} R{row} C{col} field={field} fyq={fy}Q{q} in_last5={in_last5} existing={old_val} new={new_val} diff={diff} "
+                            f"WARN {code4} R{row} C{col} field={field} fyq={fy}Q{q} in_last5={in_last5} existing={old_val} new={new_val} diff={diff}{variant_info} "
                             f"(period_end={period_end.isoformat()}, as_of={rec.get('as_of')}, source={rec.get('source')}, doc_kind={rec.get('doc_kind')}, suffix={rec.get('suffix')}, debt_ctx={rec.get('debt_ctx')}, title={rec.get('title','')})"
                         )
 
