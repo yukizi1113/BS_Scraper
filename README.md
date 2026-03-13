@@ -14,7 +14,7 @@
 | 上書きポリシー | **空欄のみ**書き込み（既存値は保護） |
 | WARN 判定 | 既存値と取得値の差が `warn_tolerance`（デフォルト ±2 百万円）超で橙色マーク |
 | 対応銘柄コード | 4 桁数字（例: 9760）および英数混合（例: 142A）の新形式 |
-| Current Version | v26_181 |
+| Current Version | v26_182 |
 
 ---
 
@@ -154,6 +154,7 @@ python bs_scraper.py \
 | `--days-back-tdnet` | `35` | TDNet lookback window |
 | `--sleep-edinet` | `0.8` | EDINET リクエスト間隔（秒） |
 | `--sleep-tdnet` | `0.8` | TDNet リクエスト間隔（秒） |
+| `--progress-mode` | `auto` | 進捗表示モード（`auto` / `plain` / `off`）。Colab や subprocess 実行で見えない場合は `plain` |
 | `--preflight-only` | off | preflight チェックのみ実行して終了 |
 | `--preflight-skip-network` | off | preflight でネットワーク疎通チェックをスキップ |
 | `--regression-suite` | `` | オフライン回帰スイートのパス（dir or zip）。指定時は EDINET/TDNet にアクセスしない |
@@ -208,6 +209,7 @@ EDINET_API_KEY=your_edinet_api_key_here
 
 | バージョン | 主な変更 |
 |-----------|---------|
+| v26_182 | Add line-oriented progress output for Colab/subprocess runs. Add `--progress-mode` (`auto` / `plain` / `off`) and keep `--only-tickers` subset execution visible at startup |
 | v26_181 | Exclude bank call money from short_term_borrowings. Add TDNet GitHub mirror fallback for XBRL ZIPs from 2025-12-15 onward. Tighten bond short/long rebucket guards to fix 9502 without regressing 8388 |
 | v26_165 | Include bank call money (`CallMoneyLiabilitiesBNK`) in short-term borrowings. Exclude sell-back and bond-lending collateral balances. |
 | v26_150 | IFRS の `非流動` containing `流動` による誤分類を修正（リース CL/NCL パース改善、4506 対応） |
@@ -222,6 +224,7 @@ EDINET_API_KEY=your_edinet_api_key_here
 - EDINET の遡及日数（`--days-back-edinet`）を大きくすると、より古いデータを取得できますが実行時間も増加します。
 - TDNet public retention is short (about 35 days), but this version also backfills historical XBRL ZIPs from the GitHub mirror `yukizi1113/tdnet` for dates from 2025-12-15 onward.
 - `--days-back-tdnet` still controls how far the scraper scans TDNet itself.
+- Colab から `subprocess.run()` で起動する場合は `--progress-mode plain` を付けると、改行ベースの進捗表示が残ります。
 - `--regression-suite` を使ったオフライン検証では、スイート内のローカル ZIP を使用するため EDINET/TDNet へのアクセスは発生しません。
 
 ---

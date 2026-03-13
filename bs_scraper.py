@@ -74,8 +74,112 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 
+_PROGRESS_MODE = (os.environ.get("BS_PROGRESS_MODE") or "auto").strip().lower() or "auto"
+
+
+def _running_inside_colab() -> bool:
+    """Best-effort Colab detection for child Python processes.
+
+    The user runs this scraper via subprocess from a Colab cell. In that path,
+    `google.colab` is often not imported inside the child process, so rely on
+    Colab-specific environment variables as well.
+    """
+    if "google.colab" in sys.modules:
+        return True
+    for key in ("COLAB_RELEASE_TAG", "COLAB_BACKEND_VERSION", "COLAB_GPU", "GCE_METADATA_HOST"):
+        if os.environ.get(key):
+            return True
+    return False
+
+
+def _set_progress_mode(mode: str) -> None:
+    global _PROGRESS_MODE
+    s = str(mode or "").strip().lower()
+    if s:
+        _PROGRESS_MODE = s
+
+
+def _resolve_progress_mode() -> str:
+    mode = (_PROGRESS_MODE or "auto").strip().lower()
+    if mode in {"off", "0", "false", "none"}:
+        return "off"
+    if mode in {"plain", "text", "ascii"}:
+        return "plain"
+    if tqdm is None:
+        return "off"
+    if _running_inside_colab():
+        return "plain"
+    # In notebook/subprocess/captured-output runs, tqdm's default stderr + CR updates
+    # can be invisible or immediately cleared. Force plain stdout bars there so the
+    # user can monitor long EDINET/TDNet scans in Colab.
+    if not sys.stdout.isatty() or not sys.stderr.isatty():
+        return "plain"
+    return "auto"
+
+
+def _plain_progress(it, **kwargs):
+    """Line-oriented progress for Colab/subprocess/captured output.
+
+    tqdm's carriage-return updates are often invisible when the scraper is
+    launched via subprocess from Colab. Emit newline-based snapshots instead.
+    """
+    desc = str(kwargs.get("desc") or "Progress")
+    total = kwargs.get("total")
+    if total is None:
+        try:
+            total = len(it)  # type: ignore[arg-type]
+        except Exception:
+            total = None
+    mininterval = float(kwargs.get("mininterval", 1.0) or 1.0)
+    width = 24
+    started = time.perf_counter()
+    last_print = started - mininterval
+    count = 0
+
+    def _emit(final: bool = False) -> None:
+        nonlocal last_print
+        now = time.perf_counter()
+        if not final and (now - last_print) < mininterval:
+            return
+        elapsed = now - started
+        if total:
+            pct = min(max(count / max(int(total), 1), 0.0), 1.0)
+            filled = min(width, max(0, int(width * pct)))
+            bar = "#" * filled + "-" * (width - filled)
+            print(
+                f"[{desc}] {count}/{total} [{bar}] {pct * 100:5.1f}% elapsed={elapsed:,.1f}s",
+                file=sys.stdout,
+                flush=True,
+            )
+        else:
+            print(
+                f"[{desc}] {count} items elapsed={elapsed:,.1f}s",
+                file=sys.stdout,
+                flush=True,
+            )
+        last_print = now
+
+    _emit(final=False)
+    for item in it:
+        count += 1
+        _emit(final=False)
+        yield item
+    _emit(final=True)
+
+
 def _progress(it, **kwargs):
-    return tqdm(it, **kwargs) if tqdm is not None else it
+    mode = _resolve_progress_mode()
+    if mode == "off":
+        return it
+    if mode == "plain":
+        kw = dict(kwargs)
+        kw.setdefault("mininterval", 1.0)
+        return _plain_progress(it, **kw)
+    if tqdm is None:
+        return it
+    kw = dict(kwargs)
+    kw.setdefault("dynamic_ncols", True)
+    return tqdm(it, **kw)
 
 
 # Early warning buffer (available during EDINET/TDNet scraping before Excel phase)
@@ -9998,6 +10102,7 @@ def main():
     parser.add_argument('--days-back-tdnet', type=int, default=DAYS_BACK_TDNET)
     parser.add_argument('--sleep-edinet', type=float, default=SLEEP_EDINET)
     parser.add_argument('--sleep-tdnet', type=float, default=SLEEP_TDNET)
+    parser.add_argument('--progress-mode', default='', help='進捗表示モード。auto/plain/off。Colab で見えない場合は plain を指定。')
     parser.add_argument('--preflight-only', action='store_true')
     parser.add_argument('--preflight-skip-network', action='store_true')
     parser.add_argument('--regression-suite', default='', help='[OFFLINE] 回帰スイート(展開済みdirまたはzip)を指定。指定時はEDINET/TDNetへアクセスせずローカルZIPから抽出。')
@@ -10012,6 +10117,8 @@ def main():
     parser.add_argument('--suspicious-small-scale', type=str, default='2000')
     parser.add_argument('--suspicious-small-abs-tol', type=str, default='2')
     args = parser.parse_args()
+    _set_progress_mode(args.progress_mode)
+    print(f"[INFO] progress_mode={_resolve_progress_mode()}")
 
     # --- Internal worker mode (OFFLINE subprocess extraction) ---
     # Invoked only when build_edinet_store_from_regression_suite() enables --offline-subprocess.
@@ -10049,6 +10156,10 @@ def main():
 
     api_key = args.edinet_api_key.strip() or EDINET_API_KEY
     only_tickers = _parse_only_tickers_args(args.only_tickers, args.only_tickers_file)
+    if only_tickers:
+        shown = ",".join(sorted(only_tickers)[:20])
+        suffix = "..." if len(only_tickers) > 20 else ""
+        print(f"[INFO] only_tickers={shown}{suffix} count={len(only_tickers)}")
 
     # Mandatory preflight
     rows_to_process, tickers, row2ticker = preflight(
