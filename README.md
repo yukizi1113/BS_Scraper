@@ -14,7 +14,7 @@
 | 上書きポリシー | **空欄のみ**書き込み（既存値は保護） |
 | WARN 判定 | 既存値と取得値の差が `warn_tolerance`（デフォルト ±2 百万円）超で橙色マーク |
 | 対応銘柄コード | 4 桁数字（例: 9760）および英数混合（例: 142A）の新形式 |
-| 現行バージョン | v26_165 |
+| Current Version | v26_181 |
 
 ---
 
@@ -151,7 +151,7 @@ python bs_scraper.py \
 | `--only-tickers` | `` | カンマ/空白区切り ticker ホワイトリスト（例: `1301,130A`） |
 | `--only-tickers-file` | `` | ticker リストを 1 行 1 ticker で記載したファイル |
 | `--days-back-edinet` | `260` | EDINET の遡及日数 |
-| `--days-back-tdnet` | `35` | TDNet の遡及日数 |
+| `--days-back-tdnet` | `35` | TDNet lookback window |
 | `--sleep-edinet` | `0.8` | EDINET リクエスト間隔（秒） |
 | `--sleep-tdnet` | `0.8` | TDNet リクエスト間隔（秒） |
 | `--preflight-only` | off | preflight チェックのみ実行して終了 |
@@ -208,7 +208,8 @@ EDINET_API_KEY=your_edinet_api_key_here
 
 | バージョン | 主な変更 |
 |-----------|---------|
-| v26_165 | 銀行コールマネー（`CallMoneyLiabilitiesBNK`）を短期借入債務に含める（セルバック・債券担保取引は除外） |
+| v26_181 | Exclude bank call money from short_term_borrowings. Add TDNet GitHub mirror fallback for XBRL ZIPs from 2025-12-15 onward. Tighten bond short/long rebucket guards to fix 9502 without regressing 8388 |
+| v26_165 | Include bank call money (`CallMoneyLiabilitiesBNK`) in short-term borrowings. Exclude sell-back and bond-lending collateral balances. |
 | v26_150 | IFRS の `非流動` containing `流動` による誤分類を修正（リース CL/NCL パース改善、4506 対応） |
 | v26_117 | リース注記抽出のガード強化（満期分析表・税効果表からの誤 add-back 防止）、オフライン doc_kind 推定の回帰修正 |
 | v26_104 | 関係会社流動部分の誤バケット修正（9325）、長期関係会社ローンからの流動部分重複スキャン防止 |
@@ -219,7 +220,8 @@ EDINET_API_KEY=your_edinet_api_key_here
 
 - **Excel テンプレートは上書きされません**。既存値の差が WARN 閾値以内なら変更なし。
 - EDINET の遡及日数（`--days-back-edinet`）を大きくすると、より古いデータを取得できますが実行時間も増加します。
-- TDNet の公開期間は短い（約 35 日）ため、`--days-back-tdnet` を増やしても実質的に効果がない場合があります。
+- TDNet public retention is short (about 35 days), but this version also backfills historical XBRL ZIPs from the GitHub mirror `yukizi1113/tdnet` for dates from 2025-12-15 onward.
+- `--days-back-tdnet` still controls how far the scraper scans TDNet itself.
 - `--regression-suite` を使ったオフライン検証では、スイート内のローカル ZIP を使用するため EDINET/TDNet へのアクセスは発生しません。
 
 ---

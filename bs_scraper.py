@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import shutil
+import errno
 import os
 import sys
 import json
@@ -202,6 +204,69 @@ def better_than(new: dict, old: Optional[dict]) -> bool:
     return record_priority(new) > record_priority(old)
 
 
+_RESCUE_KEEP_NONDEBT_FIELDS = (
+    "assets_total",
+    "current_assets",
+    "cash_eq_st_invest",
+    "cash_eq_st_invest_alt",
+    "cash_eq_st_invest_ext",
+    "current_liabilities",
+    "income_taxes_payable",
+    "shares_outstanding",
+)
+
+
+def _merge_asr_rescued_current_debt(prev: dict, rescued_current: dict) -> dict:
+    """
+    Merge an original ASR current row into a later ASR prior row, but only for debt fields.
+
+    Why this exists:
+    - The rescue is needed because old FY-end debt splits can be more complete in the original ASR current
+      than in a later filing's ASR prior (8425 / 9021 / 9022 family).
+    - Replacing the WHOLE record with the older current filing causes broad regressions in non-debt fields
+      (assets / cash / shares / taxes), because later ASR prior can legitimately differ due to presentation,
+      restatement, or context selection.
+    - Therefore keep the later prior's non-debt fields, but pin debt fields to the rescued current filing.
+
+    Keep suffix=current so later ASR prior rows cannot overwrite the rescued debt split by priority.
+    """
+    merged = dict(rescued_current or {})
+    prev = dict(prev or {})
+    for k in _RESCUE_KEEP_NONDEBT_FIELDS:
+        if k in prev:
+            merged[k] = prev.get(k)
+    merged["_rescued_non_debt_from_docID"] = prev.get("docID")
+    merged["_rescued_non_debt_from_as_of"] = prev.get("as_of")
+    merged["_completeness"] = completeness_score(merged)
+    return merged
+
+
+def _should_rescue_asr_current_for_period(prev: Optional[dict]) -> bool:
+    """
+    Decide whether an older FY-end should trigger original-ASR-current rescue.
+
+    Policy:
+    - If the existing row is not an ASR prior, rescue is still useful because we want the FY-end ASR current.
+    - If the existing row is an ASR prior, rescue only when its debt values are internally inconsistent with
+      its own explicit schedule candidate. Otherwise broad rescue just churns old FY-end rows and creates
+      unrelated WARNs without improving debt.
+    """
+    if not isinstance(prev, dict):
+        return True
+    if prev.get("doc_kind") != "ASR":
+        return True
+    if prev.get("suffix") != "prior":
+        return False
+    for field in ("short_term_borrowings", "long_term_borrowings"):
+        base = to_decimal_safe(prev.get(field))
+        sched = to_decimal_safe(prev.get(f"{field}_sched"))
+        if base is None or sched is None:
+            continue
+        if (base - sched).copy_abs() > Decimal("2"):
+            return True
+    return False
+
+
 # =============================
 # Target BS fields
 # =============================
@@ -313,11 +378,11 @@ ST_BORROWINGS_DIRECT_CONCEPTS = [
     "us-gaap:ShortTermBorrowings",
 ]
 
-# User-confirmed bank rule (2026-02-27):
-# - Include call money in short_term_borrowings.
+# Current bank policy (updated 2026-03-13):
+# - Exclude call money from short_term_borrowings.
 # - Exclude sell-buy-back payables / securities lending collateral payables from borrowings.
-# We keep call-money as a separate narrow concept list and add it explicitly in extract_debt_components_xbrl
-# (instead of broadening borrowings totals) to avoid accidental inclusion of excluded BNK liabilities.
+# Keep call money as a separate narrow concept list for diagnostics / future policy review.
+# Do NOT fold it into generic borrowings totals unless the workbook definition is changed explicitly.
 BANK_CALL_MONEY_CL_CONCEPTS = [
     "jppfs_cor:CallMoneyLiabilitiesBNK",
 ]
@@ -558,6 +623,14 @@ SHARES_CONCEPTS = [
     "jppfs_cor:NumberOfIssuedSharesAtTheEndOfFiscalYear",
     "jppfs_cor:NumberOfIssuedSharesAtTheEndOfQuarterlyPeriod",
     "jppfs_cor:NumberOfIssuedSharesAtTheEndOfPeriod",
+    # TDNet quarterly-results XBRL often uses "IssuedAndOutstandingShares" naming (not plain "IssuedShares").
+    # Without this family, shares stay blank for many mirror disclosures even when explicit values exist.
+    "jppfs_cor:NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
+    "jppfs_cor:NumberOfIssuedAndOutstandingSharesAtTheEndOfQuarterlyPeriodIncludingTreasuryStock",
+    "jppfs_cor:NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriodIncludingTreasuryStock",
+    "jppfs_cor:NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYear",
+    "jppfs_cor:NumberOfIssuedAndOutstandingSharesAtTheEndOfQuarterlyPeriod",
+    "jppfs_cor:NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriod",
     "ifrs-full:NumberOfSharesIssued",
     "us-gaap:CommonStockSharesIssued",
     "us-gaap:CommonStockSharesOutstanding",
@@ -771,8 +844,12 @@ def choose_bs_contexts(
     rel_freq = Counter(relevant_ctx)
 
     def score_ctx(cid: str):
-        base = 1 if "member" not in (cid or "").lower() else 0
-        return (base, rel_freq.get(cid, 0), freq.get(cid, 0))
+        low = (cid or "").lower()
+        # FilingDateInstant often has many disclosure-fact tags but is not a balance-sheet period end.
+        # If this penalty is removed, filings like 6301 can flip current BS date to the filing date itself.
+        non_filing = 0 if "filingdateinstant" in low else 1
+        consolidated_like = 1 if "member" not in low else 0
+        return (non_filing, consolidated_like, rel_freq.get(cid, 0), freq.get(cid, 0))
 
     def score_date(d: dt.date):
         cands = instants.get(d, [])
@@ -802,14 +879,17 @@ def choose_bs_contexts(
         return date_rel_total(d) >= 5
 
     def is_close_score(d1: dt.date, d2: dt.date) -> bool:
-        # Compare by (base, relevant_count). We intentionally ignore the raw freq dimension here.
+        # Compare by (non_filing, consolidated_like, relevant_count).
+        # We intentionally ignore the raw freq dimension here.
         s1 = score_date(d1)
         s2 = score_date(d2)
         if s1[0] != s2[0]:
             return False
+        if s1[1] != s2[1]:
+            return False
         # If best has very small count, do not treat as close.
-        best_rel = max(int(s2[1]), 0)
-        cand_rel = max(int(s1[1]), 0)
+        best_rel = max(int(s2[2]), 0)
+        cand_rel = max(int(s1[2]), 0)
         if best_rel <= 0:
             return False
         # Close if within 30% of best (or within 3 counts).
@@ -969,6 +1049,82 @@ def scan_max_by_localname(v_full, ctx: str, include_re: re.Pattern, exclude_re: 
         if include_re.search(ln):
             vals.append(v)
     return int(max(vals)) if vals else None
+
+
+def _scan_fluidity_lease_receivable_payables_cl_yen(v_full, ctx: Optional[str]) -> Optional[int]:
+    if not ctx:
+        return None
+    return scan_sum_by_localname(
+        v_full,
+        ctx,
+        lambda ln: (
+            "PayablesUnderFluidityLeaseReceivables" in str(ln)
+            and "NCL" not in str(ln)
+        ),
+    )
+
+
+def _scan_fluidity_lease_receivable_payables_ncl_yen(v_full, ctx: Optional[str]) -> Optional[int]:
+    if not ctx:
+        return None
+    return scan_sum_by_localname(
+        v_full,
+        ctx,
+        lambda ln: (
+            "LongTermPayablesUnderFluidityLeaseReceivables" in str(ln)
+            and "CurrentPortion" not in str(ln)
+        ),
+    )
+
+
+def _scan_railway_equipment_payables_cl_yen(v_full, ctx: Optional[str]) -> Optional[int]:
+    if not ctx:
+        return None
+    return scan_sum_by_localname(
+        v_full,
+        ctx,
+        lambda ln: (
+            str(ln).startswith("CurrentPortionOfLongTermAccountsPayableRailwayEquipment")
+            or str(ln).startswith("AccountsPayableRailwayEquipment")
+        ),
+    )
+
+
+def _scan_railway_equipment_payables_ncl_yen(v_full, ctx: Optional[str]) -> Optional[int]:
+    if not ctx:
+        return None
+    return scan_sum_by_localname(
+        v_full,
+        ctx,
+        lambda ln: str(ln).startswith("LongTermAccountsPayableRailwayEquipment"),
+    )
+
+
+def _scan_explicit_long_term_debt_cl_yen(v_full, ctx: Optional[str]) -> Optional[int]:
+    if not ctx:
+        return None
+    return scan_sum_by_localname(
+        v_full,
+        ctx,
+        lambda ln: (
+            str(ln).startswith("CurrentPortionOfLongTermDebt")
+            and "Summary" not in str(ln)
+        ),
+    )
+
+
+def _scan_explicit_long_term_debt_ncl_yen(v_full, ctx: Optional[str]) -> Optional[int]:
+    if not ctx:
+        return None
+    return scan_sum_by_localname(
+        v_full,
+        ctx,
+        lambda ln: (
+            str(ln).startswith("LongTermDebt")
+            and "Summary" not in str(ln)
+            and "Current" not in str(ln)
+        ),
+    )
 
 
 def extract_fy_end_month_from_dei(facts: List[Fact]) -> Optional[int]:
@@ -1430,6 +1586,42 @@ def extract_debt_components_xbrl(v_full, v_local, ctx: Optional[str]) -> dict:
     bonds_ncl = calc_bonds_noncurrent(v_full, v_local, ctx)
     lease_ncl = calc_lease_noncurrent(v_full, v_local, ctx)
 
+    # Explicit debt-like obligations that are not tagged as generic borrowings/bonds.
+    #
+    # Why this exists:
+    # - Leasing issuers (8424/8439/8593 and similar) disclose
+    #   PayablesUnderFluidityLeaseReceivables* as separate financing obligations.
+    #   Excluding them understates both ST/LT debt even when the XBRL is explicit.
+    # - JR issuers (9020/9021/9022 and similar) disclose
+    #   AccountsPayableRailwayEquipment* and, for some filings, LongTermDebt* as
+    #   explicit financing liabilities outside the generic loan/bond concepts.
+    #
+    # Safety:
+    # - Keep this narrow. Do NOT widen to generic AccountsPayable / Payables names.
+    # - Only add these when the side does not already come from a broad total concept,
+    #   otherwise we risk double-counting a total that already includes them.
+    # - Explicit LongTermDebt* is only added when the chosen base concept is not already
+    #   a LongTermDebt* concept; otherwise the same fact would be counted twice.
+    fluidity_payables_cl = None
+    railway_eq_payables_cl = None
+    explicit_lt_debt_cl = None
+    if total_cl is None:
+        fluidity_payables_cl = _scan_fluidity_lease_receivable_payables_cl_yen(v_full, ctx)
+        railway_eq_payables_cl = _scan_railway_equipment_payables_cl_yen(v_full, ctx)
+        cur_port_lname = local_name(cur_port_key or "")
+        if not cur_port_lname.startswith("CurrentPortionOfLongTermDebt"):
+            explicit_lt_debt_cl = _scan_explicit_long_term_debt_cl_yen(v_full, ctx)
+
+    fluidity_payables_ncl = None
+    railway_eq_payables_ncl = None
+    explicit_lt_debt_ncl = None
+    if total_ncl is None:
+        fluidity_payables_ncl = _scan_fluidity_lease_receivable_payables_ncl_yen(v_full, ctx)
+        railway_eq_payables_ncl = _scan_railway_equipment_payables_ncl_yen(v_full, ctx)
+        loans_ncl_lname = local_name(loans_ncl_key or "")
+        if not loans_ncl_lname.startswith("LongTermDebt"):
+            explicit_lt_debt_ncl = _scan_explicit_long_term_debt_ncl_yen(v_full, ctx)
+
     # ------------------------------------------------------------------
     # Regression fix (v26_144, user-confirmed via 4506):
     # Some filings provide a broad noncurrent borrowings total (BORROWINGS_NCL_TOTAL_CONCEPTS) in XBRL.
@@ -1474,9 +1666,18 @@ def extract_debt_components_xbrl(v_full, v_local, ctx: Optional[str]) -> dict:
 
     # Prefer InterestBearingLiabilities totals only when they match the component sum.
     # Some filers' IBL totals exclude lease / current portion etc; blindly trusting them causes false warnings.
-    # User-confirmed bank rule: include call money in short_term_borrowings.
-    # Excluded bank liabilities (repos / securities lending collateral) are intentionally NOT included.
-    comp_st = sum_nullable(loans_cl, bonds_cl, cp_cl, call_money_cl, lease_cl)
+    # Current policy (2026-03-13): short_term_borrowings excludes call money.
+    # Keep call_money_cl separate for diagnostics, but do not fold it into the debt total here.
+    # Excluded bank liabilities (repos / securities lending collateral) remain intentionally excluded.
+    comp_st = sum_nullable(
+        loans_cl,
+        bonds_cl,
+        cp_cl,
+        lease_cl,
+        fluidity_payables_cl,
+        railway_eq_payables_cl,
+        explicit_lt_debt_cl,
+    )
 
     # Special IFRS pattern (e.g., Link & Motivation):
     # InterestBearingLiabilities*IFRS often excludes lease liabilities, which are tagged separately.
@@ -1497,7 +1698,14 @@ def extract_debt_components_xbrl(v_full, v_local, ctx: Optional[str]) -> dict:
     else:
         st_total = comp_st
 
-    lt_comp = sum_nullable(loans_ncl, bonds_ncl, lease_ncl)
+    lt_comp = sum_nullable(
+        loans_ncl,
+        bonds_ncl,
+        lease_ncl,
+        fluidity_payables_ncl,
+        railway_eq_payables_ncl,
+        explicit_lt_debt_ncl,
+    )
 
     # Special IFRS pattern (e.g., Link & Motivation): IBL may exclude lease liabilities.
     if ibl_ncl is not None and lease_ncl not in (None, 0) and (loans_ncl in (None, 0)) and (bonds_ncl in (None, 0)):
@@ -1526,7 +1734,9 @@ def extract_debt_components_xbrl(v_full, v_local, ctx: Optional[str]) -> dict:
 
     return {
         "loans_cl": loans_cl, "bonds_cl": bonds_cl, "cp_cl": cp_cl, "call_money_cl": call_money_cl, "lease_cl": lease_cl, "st_total": st_total,
+        "fluidity_payables_cl": fluidity_payables_cl, "railway_eq_payables_cl": railway_eq_payables_cl, "explicit_lt_debt_cl": explicit_lt_debt_cl,
         "loans_ncl": loans_ncl, "bonds_ncl": bonds_ncl, "lease_ncl": lease_ncl, "lt_total": lt_total,
+        "fluidity_payables_ncl": fluidity_payables_ncl, "railway_eq_payables_ncl": railway_eq_payables_ncl, "explicit_lt_debt_ncl": explicit_lt_debt_ncl,
     }
 
 def extract_debt_and_lease(v_full, v_local, ctx: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
@@ -1534,79 +1744,150 @@ def extract_debt_and_lease(v_full, v_local, ctx: Optional[str]) -> Tuple[Optiona
     return comps.get("st_total"), comps.get("lt_total")
 
 
-def extract_shares(v_full, v_local, ctx: Optional[str]) -> Optional[int]:
-    """Extract issued shares for a given context.
+def extract_shares(
+    v_full,
+    v_local,
+    ctx: Optional[str],
+    *,
+    ctx_info: Optional[Dict[str, dict]] = None,
+    target_date: Optional[dt.date] = None,
+    prefer_current_fallback: bool = False,
+) -> Optional[int]:
+    """Extract issued shares.
 
-    Regression fix (v26_103):
-    - Some filings tag multiple 'NumberOfIssuedShares*' concepts in the same context,
-      including class / preferred shares (e.g., "ClassAPreferredShares") alongside the
-      ordinary shares total (e.g., "SummaryOfBusinessResults").
-    - Prior logic picked the longest localname, which could incorrectly select a small
-      preferred/class share count (e.g., 1,000) and create false WARNs.
-    - New logic:
-        1) Prefer canonical concepts (SHARES_CONCEPTS) if present.
-        2) Otherwise score candidates and prefer non-preferred / summary / including-treasury,
-           and finally larger counts.
+    Base behavior:
+      1) Try canonical share concepts in the selected BS context.
+      2) Fallback to NumberOfIssuedShares* / NumberOfIssuedAndOutstandingShares* candidates in that same context.
+
+    v26_166 regression fix:
+    - Many SSR filings (e.g., 1768/1810/4502/5711/7282/8309/9115/9980) tag issued-shares only
+      in FilingDateInstant* contexts; BS context has no share tag, so previous logic returned None.
+    - We now add a *current-only* cross-context fallback:
+        - evaluate all NumberOfIssuedShares* / NumberOfIssuedAndOutstandingShares* facts,
+          with strong guards against preferred/class rows;
+        - prefer period-end-like naming (AsOfFiscalYearEnd / AtTheEndOf*) over summary-only labels;
+        - use target-date/filling-date as a tie-breaker.
+    - Prior-period fallback remains strict (target_date exact match only) to avoid copying current
+      filing-date shares into prior columns.
+
+    Do NOT remove this fallback without re-running shares regression for the 2026-03-06 target set.
     """
-    if not ctx:
-        return None
-    v = first_value(v_full, v_local, SHARES_CONCEPTS, ctx)
-    if v is not None:
-        return v
+    canon_locals = [local_name(c).lower() for c in SHARES_CONCEPTS]
 
-    cand = []
-    for (lname, c), val in v_local.items():
-        if c != ctx or val is None:
-            continue
-        if "NumberOfIssuedShares" not in lname:
-            continue
-        cand.append((lname, val))
-
-    if not cand:
-        return None
-
-    def _score(item):
-        lname, val = item
-        low = (lname or "").lower()
-
-        # Heuristics to avoid picking preferred/class share counts when ordinary total exists.
-        is_preferred_like = any(k in low for k in [
+    def _is_preferred_like(low: str) -> bool:
+        return any(k in low for k in [
             "preferred", "preference", "classapreferred", "classbpreferred",
             "classa", "classb", "series", "typea", "typeb", "kind",
         ])
+
+    def _is_shares_like_lname(lname: str) -> bool:
+        s = str(lname or "")
+        return ("NumberOfIssuedShares" in s) or ("NumberOfIssuedAndOutstandingShares" in s)
+
+    def _base_score(item: Tuple[str, int]):
+        lname, val = item
+        low = (lname or "").lower()
         is_summary_like = ("summaryofbusinessresults" in low) or ("summary" in low)
         includes_treasury = ("includingtreasurystock" in low)
-        # Prefer ordinary totals; then summary-like; then including treasury; then longer name; then larger value.
         try:
             v_int = int(val)
         except Exception:
             v_int = 0
         return (
-            0 if is_preferred_like else 1,
+            0 if _is_preferred_like(low) else 1,
             1 if is_summary_like else 0,
             1 if includes_treasury else 0,
             len(lname or ""),
             v_int,
         )
 
-    # If we have any non-preferred-like candidate, prefer among them.
-    non_pref = [x for x in cand if _score(x)[0] == 1]
-    pool = non_pref if non_pref else cand
-    best = max(pool, key=_score)
-    return best[1]
+    def _fallback_score(item: Tuple[str, int]):
+        lname, val = item
+        low = (lname or "").lower()
+        is_summary_like = ("summaryofbusinessresults" in low) or ("summary" in low)
+        includes_treasury = ("includingtreasurystock" in low) or ("treasurystock" in low)
+        is_period_end_like = any(k in low for k in [
+            "attheendof",
+            "asoffiscalyearend",
+            "asofquarterlyperiodend",
+            "asofinterimperiodend",
+            "asofperiodend",
+        ])
+        is_asof_filing = ("asoffilingdate" in low)
+        is_canonical_family = any(low.startswith(cl) for cl in canon_locals)
+        try:
+            v_int = int(val)
+        except Exception:
+            v_int = 0
+        return (
+            0 if _is_preferred_like(low) else 1,
+            1 if is_canonical_family else 0,
+            1 if is_period_end_like else 0,
+            1 if includes_treasury else 0,
+            1 if is_asof_filing else 0,
+            0 if is_summary_like else 1,
+            len(lname or ""),
+            v_int,
+        )
 
-
-    v = first_value(v_full, v_local, SHARES_CONCEPTS, ctx)
-    if v is not None:
-        return v
-    cand = []
-    for (lname, c), val in v_local.items():
-        if c == ctx and val is not None and "NumberOfIssuedShares" in lname:
+    def _best_in_ctx(target_ctx: Optional[str]) -> Optional[int]:
+        if not target_ctx:
+            return None
+        v = first_value(v_full, v_local, SHARES_CONCEPTS, target_ctx)
+        if v is not None:
+            return v
+        cand = []
+        for (lname, c), val in v_local.items():
+            if c != target_ctx or val is None:
+                continue
+            if not _is_shares_like_lname(lname):
+                continue
             cand.append((lname, val))
-    if cand:
-        cand.sort(key=lambda x: (("IncludingTreasuryStock" in x[0]), len(x[0])), reverse=True)
-        return cand[0][1]
-    return None
+        if not cand:
+            return None
+        non_pref = [x for x in cand if _base_score(x)[0] == 1]
+        pool = non_pref if non_pref else cand
+        return max(pool, key=_base_score)[1]
+
+    # Primary path: selected BS context.
+    v_ctx = _best_in_ctx(ctx)
+    if v_ctx is not None:
+        return v_ctx
+
+    # Cross-context fallback.
+    # For prior values we keep strict date matching only (no FilingDate fallback), otherwise prior can be polluted.
+    # For current values we allow broader search because SSR filings often put shares only on FilingDateInstant*.
+    if not ctx_info:
+        return None
+
+    best_key = None
+    best_val = None
+    for (lname, c), val in v_local.items():
+        if not c or val is None or not _is_shares_like_lname(lname):
+            continue
+        info = ctx_info.get(c) or {}
+        cdate = info.get("instant_date")
+
+        if not prefer_current_fallback:
+            if target_date is None or cdate != target_date:
+                continue
+
+        item = (lname, val)
+        score = _fallback_score(item)
+
+        # Use date relation as tiebreak only; the concept quality score remains the primary selector.
+        date_rank = 0
+        if target_date is not None and cdate == target_date:
+            date_rank = 2
+        elif prefer_current_fallback and "filingdateinstant" in (c or "").lower():
+            date_rank = 1
+
+        key = (score, date_rank)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_val = val
+
+    return best_val
 
 
 # -----------------------------
@@ -1851,6 +2132,16 @@ _LEASE_LNAME_EXCLUDE_RE = re.compile(r"(Expense|Cost|Payment|Interest|Depreciati
 #       Tightening include/exclude here prevents misclassifying provisions as lease debts (1878 regression).
 _LEASE_LNAME_RE_CL = re.compile(r"(Lease).*?(Liabil|Oblig).*?(Current|ShortTerm|(?<!N)CL)", re.I)
 _LEASE_LNAME_RE_NCL = re.compile(r"(Lease).*(Liabil|Oblig).*(Noncurrent|NCL|LongTerm|NonCurrent)", re.I)
+# Borrowings schedules sometimes include debt-like rows that are neither loans, bonds, nor leases.
+# Keep this narrow: only rows that are explicitly used as financing liabilities in the schedule.
+# Regression targets:
+# - 9021: その他流動負債（社内預金）, 鉄道施設購入未払金 / 長期未払金
+# - 9022: 預り金, その他の流動負債, その他の固定負債, 鉄道施設購入長期未払金
+# Do NOT widen this to generic "未払金" / "その他" outside 借入金等明細表, or non-debt rows will leak in.
+_BORROWINGS_SCHEDULE_OTHER_INTEREST_RE = re.compile(
+    r"(社内預金|預り金|鉄道(?:施設|設備)購入(?:長期)?未払金|その他(?:の)?流動負債|その他(?:の)?固定負債)",
+    re.I,
+)
 # Exclude obvious balance-sheet tables from being mistaken as "借入金等明細表".
 # Regression note: BS tables often contain words like "借入金"/"社債"/"リース" and can pass keyword gates.
 # If parsed as a schedule, it can create bogus additions (e.g., INPEX where "関係会社債務保証..." triggered bond regex).
@@ -2424,7 +2715,10 @@ def extract_debt_operating_lease_borrowings_from_consolidated_bs_6301style(ixbrl
         return nums
 
     try:
-        soup = BeautifulSoup(ixbrl_html, "lxml", parse_only=SoupStrainer("table"))
+        # Use a full parse here because the note heading sits OUTSIDE the table.
+        # parse_only=SoupStrainer("table") would drop the surrounding "有利子負債の内訳" text and
+        # make near_text-based gating impossible, which reintroduces 9201-family misses.
+        soup = BeautifulSoup(ixbrl_html, "lxml")
     except Exception:
         return empty
 
@@ -2517,6 +2811,517 @@ def extract_debt_operating_lease_borrowings_from_zip_6301style(zip_bytes: bytes)
                     break
     except Exception:
         return empty
+    return best if isinstance(best, dict) else empty
+
+
+def extract_general_debt_pair_from_consolidated_tables(ixbrl_html: str) -> dict[str, int | None]:
+    """Extract explicit consolidated debt totals from BS/note tables.
+
+    This parser exists for NonConsolidatedMember regressions such as 6645 / 6448 / 6702 prior:
+      - XBRL debt facts are parent-company only (or mixed), while the filing also contains an explicit
+        consolidated BS / note table that breaks out short/long borrowings, bonds, CP/call money, and leases.
+      - In those cases the correct consolidated total can be *smaller* than the parent XBRL total, so the
+        undercount-only consolidated rescue at the end of process_one_zip() intentionally does not apply.
+
+    Safety policy:
+      - No ticker branching.
+      - Only parse files/tables that are clearly consolidated ("Consolidated" or "連結") and NOT marked
+        nonconsolidated.
+      - Only use explicit debt rows in the same table.
+      - Generic "その他の金融負債"/fair-value tables are ignored unless the table also has explicit debt rows
+        needed to build both the short and long totals.
+      - Smaller replacement is NOT decided here; caller must additionally require debt_ctx_* to be
+        NonConsolidatedMember before overriding the final totals.
+    """
+    empty = {"prior": None, "prior_lt": None, "current": None, "current_lt": None}
+    if not ixbrl_html:
+        return empty
+    file_has_consolidated = (("Consolidated" in ixbrl_html) or ("連結" in ixbrl_html))
+    file_has_noncon = (("NonConsolidated" in ixbrl_html) or ("非連結" in ixbrl_html))
+    if not file_has_consolidated:
+        return empty
+    if file_has_noncon and not file_has_consolidated:
+        return empty
+
+    def _norm(s: str) -> str:
+        t = str(s or "")
+        t = t.replace("\u3000", "").replace(" ", "")
+        t = t.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        for ch in ("－", "―", "‐", "−", "–", "—", ":", "：", "（", "）", "(", ")", "[", "]", "・", "　"):
+            t = t.replace(ch, "")
+        return t
+
+    def _row_label(row: list[str]) -> str:
+        for c in row:
+            s = str(c or "").strip()
+            if s:
+                return s
+        return ""
+
+    def _row_value_from_candidates(row: list[str], cols: list[int]) -> Optional[int]:
+        for idx in cols:
+            if idx < 0 or idx >= len(row):
+                continue
+            v = _parse_int_from_cell(row[idx])
+            if v is not None:
+                return int(v)
+        return None
+
+    def _match_key(label_norm: str) -> Optional[str]:
+        if not label_norm:
+            return None
+        if label_norm == "短期借入金" or label_norm == "短期債務":
+            return "loan_cl"
+        if (
+            ("1年以内" in label_norm or "1年内" in label_norm)
+            and ("長期借入金" in label_norm or ("長期債務" in label_norm and "期限到来" in label_norm))
+        ):
+            return "cur_portion_loan"
+        if ("1年以内" in label_norm or "1年内" in label_norm) and "社債" in label_norm and "償還予定" in label_norm:
+            return "cur_bond"
+        if ("コマーシャル" in label_norm and "ペーパー" in label_norm) or label_norm == "CP":
+            return "cp_cl"
+        if label_norm == "コールマネー":
+            return "call_money"
+        if ("借入金及びリース負債" in label_norm) and ("非流動" in label_norm):
+            return "lt_direct"
+        if ("借入金及びリース負債" in label_norm) and ("流動" in label_norm):
+            return "st_direct"
+        if (
+            label_norm in {"長期リース負債", "長期オペレーティングリース負債", "長期オペレーティングリース債務"}
+            or (("リース負債" in label_norm or "リース債務" in label_norm) and "非流動" in label_norm)
+        ):
+            return "lease_ncl"
+        if (
+            label_norm in {"短期リース負債", "短期オペレーティングリース負債", "短期オペレーティングリース債務"}
+            or (("リース負債" in label_norm or "リース債務" in label_norm) and "流動" in label_norm and "非流動" not in label_norm)
+            or (("リース負債" in label_norm or "リース債務" in label_norm) and ("1年以内" in label_norm or "1年内" in label_norm))
+        ):
+            return "lease_cl"
+        if label_norm == "長期借入金" or label_norm == "長期債務":
+            return "loan_ncl"
+        if label_norm in {"社債", "社債計"}:
+            return "bond_ncl"
+        return None
+
+    def _table_near_text(tbl) -> str:
+        parts = [tbl.get_text(" ", strip=True)]
+        prev = tbl
+        for _ in range(6):
+            prev = prev.find_previous()
+            if prev is None:
+                break
+            txt = prev.get_text(" ", strip=True)
+            if not txt:
+                continue
+            parts.append(txt[:400])
+            if ("Consolidated" in txt) or ("連結" in txt):
+                break
+        return " ".join(parts)
+
+    try:
+        soup = BeautifulSoup(ixbrl_html, "lxml", parse_only=SoupStrainer("table"))
+    except Exception:
+        return empty
+
+    best = dict(empty)
+    best_score = -1
+    for tbl in soup.find_all("table"):
+        ttxt = tbl.get_text(" ", strip=True)
+        if not ttxt:
+            continue
+        if _CF_TABLE_EXCLUDE_RE.search(ttxt):
+            continue
+        if _SCHEDULE_EXCLUDE_TABLE_RE.search(ttxt):
+            continue
+        near_text = _table_near_text(tbl)
+        if file_has_noncon:
+            if (("Consolidated" not in near_text) and ("連結" not in near_text)):
+                continue
+            if ("NonConsolidated" in near_text) and ("Consolidated" not in near_text) and ("連結" not in near_text):
+                continue
+
+        matrix: list[list[str]] = []
+        for tr in tbl.find_all("tr"):
+            row = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+            if row:
+                matrix.append(row)
+        if len(matrix) < 2:
+            continue
+
+        start_col, end_col = _pick_date_columns(matrix)
+        if start_col is None or end_col is None:
+            continue
+
+        unit, explicit = _detect_unit_and_explicit(near_text)
+        mul = _yen_unit_multiplier(unit)
+
+        vals_prior: dict[str, int] = {}
+        vals_current: dict[str, int] = {}
+        hits: set[str] = set()
+
+        for row in matrix[1:]:
+            if not row:
+                continue
+            label = _row_label(row)
+            label_norm = _norm(label)
+            if not label_norm:
+                continue
+            key = _match_key(label_norm)
+            if key is None:
+                continue
+            # Keep prior/current searches directional.
+            # Prior side may need to step one column LEFT when a separator column exists (6702),
+            # but must never reach into the current-side amount column (6645 bond row regression).
+            # Current side may need to step one column LEFT when end_col points to a separator,
+            # but searching broadly to the right risks rate/maturity captures.
+            prior_cols = [int(start_col), int(start_col) - 1]
+            current_cols = [int(end_col), int(end_col) - 1, int(end_col) + 1]
+            v0 = _row_value_from_candidates(row, prior_cols)
+            v1 = _row_value_from_candidates(row, current_cols)
+            if v0 is not None:
+                vals_prior[key] = int(v0) * mul
+            if v1 is not None:
+                vals_current[key] = int(v1) * mul
+            if v0 is not None or v1 is not None:
+                hits.add(key)
+
+        # Keep call money detectable, but exclude it from short-term debt totals.
+        # User review on 2026-03-13 found no positive examples where workbook input
+        # intentionally includes call money, while multiple bank rows matched
+        # "computed total - call money". Re-adding it here would reintroduce
+        # 8343/8359/8365/8381/8388 family regressions.
+        pure_st_keys = ("loan_cl", "cur_portion_loan", "cur_bond", "cp_cl", "lease_cl")
+        pure_lt_keys = ("loan_ncl", "bond_ncl", "lease_ncl")
+
+        def _sum_side(vals: dict[str, int], keys: tuple[str, ...]) -> int:
+            total = 0
+            for k in keys:
+                v = vals.get(k)
+                if isinstance(v, int) and v > 0:
+                    total += int(v)
+            return total
+
+        def _resolve_pair(vals: dict[str, int]) -> tuple[Optional[int], Optional[int], bool]:
+            st_sum = _sum_side(vals, pure_st_keys)
+            lt_sum = _sum_side(vals, pure_lt_keys)
+            st_direct = vals.get("st_direct")
+            lt_direct = vals.get("lt_direct")
+            tol = max(COMP_MATCH_TOL_YEN, 2 * mul)
+
+            if st_sum > 0 and isinstance(st_direct, int) and st_direct > 0 and abs(int(st_sum) - int(st_direct)) > tol:
+                return None, None, False
+            if lt_sum > 0 and isinstance(lt_direct, int) and lt_direct > 0 and abs(int(lt_sum) - int(lt_direct)) > tol:
+                return None, None, False
+
+            st_val = int(st_sum) if st_sum > 0 else (int(st_direct) if isinstance(st_direct, int) and st_direct > 0 else None)
+            lt_val = int(lt_sum) if lt_sum > 0 else (int(lt_direct) if isinstance(lt_direct, int) and lt_direct > 0 else None)
+            used_direct = (st_sum <= 0 and isinstance(st_direct, int) and st_direct > 0) or (lt_sum <= 0 and isinstance(lt_direct, int) and lt_direct > 0)
+            return st_val, lt_val, used_direct
+
+        # Strict gate for the "smaller-than-parent-XBRL" override use-case:
+        # require at least one split-enriching signal (lease row, current-portion row, or direct current/noncurrent total).
+        # Tables that only show generic short loan / long loan / bond rows can be valid schedules, but they are not
+        # strong enough to justify replacing NonConsolidatedMember totals with a smaller consolidated number.
+        # Without this gate, 6471/6301 candidate-2 style partial tables can override the correct later table.
+        if not hits.intersection({"cur_portion_loan", "cur_bond", "lease_cl", "lease_ncl", "st_direct", "lt_direct"}):
+            continue
+
+        prior_st, prior_lt, prior_used_direct = _resolve_pair(vals_prior)
+        current_st, current_lt, current_used_direct = _resolve_pair(vals_current)
+
+        if not ((isinstance(prior_st, int) and isinstance(prior_lt, int)) or (isinstance(current_st, int) and isinstance(current_lt, int))):
+            continue
+
+        score = 0
+        if explicit:
+            score += 2
+        score += len(hits)
+        if isinstance(current_st, int) and current_st > 0 and isinstance(current_lt, int) and current_lt > 0:
+            score += 4
+        if isinstance(prior_st, int) and prior_st > 0 and isinstance(prior_lt, int) and prior_lt > 0:
+            score += 2
+        if "前連結会計年度" in ttxt or "当連結会計年度" in ttxt or "Consolidated" in ttxt or "連結" in ttxt:
+            score += 2
+        if ("st_direct" in hits and "lt_direct" in hits) and not (prior_used_direct or current_used_direct):
+            score += 1
+        if score > best_score:
+            best_score = score
+            best = {
+                "prior": prior_st,
+                "prior_lt": prior_lt,
+                "current": current_st,
+                "current_lt": current_lt,
+                "_score": score,
+            }
+
+    return best if best_score >= 0 else empty
+
+
+def extract_general_debt_pair_from_consolidated_tables_zip(zip_bytes: bytes) -> dict[str, int | None]:
+    """Raw-ZIP fallback for strict consolidated debt-table parsing."""
+    empty = {"prior": None, "prior_lt": None, "current": None, "current_lt": None}
+    if not zip_bytes:
+        return empty
+    best = None
+    best_score = -1
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                nl = name.lower()
+                if ("/publicdoc/" not in nl) or (not nl.endswith((".htm", ".html", ".xbrl"))):
+                    continue
+                try:
+                    b = zf.read(name)
+                except Exception:
+                    continue
+                for enc in ("utf-8", "cp932", "shift_jis", "utf-16", "latin1"):
+                    try:
+                        t = b.decode(enc)
+                    except Exception:
+                        continue
+                    r = extract_general_debt_pair_from_consolidated_tables(t)
+                    if not isinstance(r, dict):
+                        continue
+                    sc = 0
+                    for k in ("current", "current_lt", "prior", "prior_lt"):
+                        v = r.get(k)
+                        if isinstance(v, int) and v > 0:
+                            sc += 2 if "current" in k else 1
+                            sc += min(int(v), 2_000_000_000_000) // 200_000_000_000
+                    if sc > best_score:
+                        best_score = sc
+                        best = r
+                    if sc >= 12:
+                        break
+                if best_score >= 12:
+                    break
+    except Exception:
+        return empty
+    return best if isinstance(best, dict) else empty
+
+
+def extract_interest_bearing_liabilities_note_pair(ixbrl_html: str) -> dict[str, int | None]:
+    """Extract short/long debt totals from explicit IFRS interest-bearing-liabilities note tables."""
+    empty = {"prior": None, "prior_lt": None, "current": None, "current_lt": None}
+    if not ixbrl_html:
+        return empty
+
+    # Use Unicode escapes here. This file contains legacy mojibake literals, and direct Japanese string
+    # insertion in new code can be silently corrupted when the file is re-serialized. Escapes keep the
+    # parser stable and avoid reintroducing 9201-family misses.
+    S_NOTE = "\u6709\u5229\u5b50\u8ca0\u50b5\u306e\u5185\u8a33"
+    S_NOTE_HEAD = "\u6709\u5229\u5b50\u8ca0\u50b5\u53ca\u3073\u305d\u306e\u4ed6\u306e\u91d1\u878d\u8ca0\u50b5"
+    S_OTHER_NOTE = "\u305d\u306e\u4ed6\u306e\u91d1\u878d\u8ca0\u50b5\u306e\u5185\u8a33"
+    S_FLOW = "\u6d41\u52d5\u8ca0\u50b5"
+    S_NFLOW = "\u975e\u6d41\u52d5\u8ca0\u50b5"
+    S_FLOW_ONLY = "\u6d41\u52d5"
+    S_NFLOW_ONLY = "\u975e\u6d41\u52d5"
+    S_TOTAL = "\u5408\u8a08"
+    S_ST_LOAN = "\u77ed\u671f\u501f\u5165\u91d1"
+    S_LT_LOAN = "\u9577\u671f\u501f\u5165\u91d1"
+    S_BOND = "\u793e\u50b5"
+    S_LEASE = "\u30ea\u30fc\u30b9\u8ca0\u50b5"
+    S_CP1 = "\u30b3\u30de\u30fc\u30b7\u30e3\u30eb\u30fb\u30da\u30fc\u30d1\u30fc"
+    S_CP2 = "\u30b3\u30de\u30fc\u30b7\u30e3\u30eb\u30da\u30fc\u30d1\u30fc"
+    S_INSTALL = "\u5272\u8ce6\u672a\u6255\u91d1"
+    S_LT_INSTALL = "\u9577\u671f\u5272\u8ce6\u672a\u6255\u91d1"
+    S_DUE_IN1 = "1\u5e74\u5185\u8fd4\u6e08\u4e88\u5b9a"
+    S_DUE_IN1B = "1\u5e74\u4ee5\u5185\u8fd4\u6e08\u4e88\u5b9a"
+    S_REDEEM1 = "1\u5e74\u5185\u511f\u9084\u4e88\u5b9a"
+    S_REDEEM1B = "1\u5e74\u4ee5\u5185\u511f\u9084\u4e88\u5b9a"
+
+    _fw_table = str.maketrans("\uff10\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19\uff08\uff09\u3000 ", "0123456789()  ")
+
+    def _norm_label(s: str) -> str:
+        t = str(s or "").translate(_fw_table)
+        t = t.replace("\u3000", "").replace(" ", "").replace("\uff0d", "-").replace("\u2015", "-")
+        t = re.sub(r"\uff08\u6ce8.*?\uff09", "", t)
+        t = re.sub(r"\(\u6ce8.*?\)", "", t)
+        return t
+
+    def _row_label(row: list[str]) -> str:
+        for c in row:
+            s = str(c or "").strip()
+            if s:
+                return s
+        return ""
+
+    def _row_value_from_candidates(row: list[str], cols: list[int]) -> Optional[int]:
+        for idx in cols:
+            if idx < 0 or idx >= len(row):
+                continue
+            v = _parse_int_from_cell(row[idx])
+            if v is not None:
+                return int(v)
+        return None
+
+    def _table_near_text(tbl) -> str:
+        parts = [tbl.get_text(" ", strip=True)]
+        prev = tbl
+        for _ in range(10):
+            prev = prev.find_previous()
+            if prev is None:
+                break
+            txt = prev.get_text(" ", strip=True)
+            if not txt:
+                continue
+            parts.append(txt[:500])
+            if (S_NOTE in txt) or (S_OTHER_NOTE in txt):
+                break
+        return " ".join(parts)
+
+    def _match_key(label_norm: str) -> Optional[str]:
+        if not label_norm:
+            return None
+        if label_norm == S_FLOW:
+            return "st_total"
+        if label_norm == S_NFLOW:
+            return "lt_total"
+        if label_norm in {S_FLOW_ONLY, S_NFLOW_ONLY, S_TOTAL}:
+            return None
+        if label_norm.startswith(S_ST_LOAN):
+            return "st_loan"
+        if (S_DUE_IN1 in label_norm or S_DUE_IN1B in label_norm) and S_LT_LOAN in label_norm:
+            return "cur_lt_loan"
+        if (S_REDEEM1 in label_norm or S_REDEEM1B in label_norm) and S_BOND in label_norm:
+            return "cur_bond"
+        if (S_DUE_IN1 in label_norm or S_DUE_IN1B in label_norm) and S_LEASE in label_norm:
+            return "lease_cl"
+        if label_norm.startswith(S_CP1) or label_norm.startswith(S_CP2) or label_norm == "CP":
+            return "cp"
+        if label_norm.startswith(S_LT_INSTALL):
+            return "installment_ncl"
+        if label_norm.startswith(S_INSTALL):
+            return "installment_cl"
+        if label_norm.startswith(S_LT_LOAN):
+            return "long_loan"
+        if label_norm.startswith(S_BOND):
+            return "bond_ncl"
+        if label_norm == S_LEASE:
+            return "lease_ncl"
+        return None
+
+    def _resolve(vals: dict[str, int], mul: int) -> tuple[Optional[int], Optional[int], int]:
+        st_sum = 0
+        lt_sum = 0
+        st_hits = 0
+        lt_hits = 0
+        for k in ("st_loan", "cur_lt_loan", "cur_bond", "cp", "lease_cl", "installment_cl"):
+            v = vals.get(k)
+            if isinstance(v, int) and v > 0:
+                st_sum += int(v)
+                st_hits += 1
+        for k in ("long_loan", "bond_ncl", "lease_ncl", "installment_ncl"):
+            v = vals.get(k)
+            if isinstance(v, int) and v > 0:
+                lt_sum += int(v)
+                lt_hits += 1
+
+        st_total = vals.get("st_total")
+        lt_total = vals.get("lt_total")
+        tol = max(COMP_MATCH_TOL_YEN, 2 * mul)
+
+        if isinstance(st_total, int) and st_total > 0 and st_sum > 0 and abs(int(st_total) - int(st_sum)) > tol:
+            return None, None, 0
+        if isinstance(lt_total, int) and lt_total > 0 and lt_sum > 0 and abs(int(lt_total) - int(lt_sum)) > tol:
+            return None, None, 0
+
+        st_val = int(st_total) if isinstance(st_total, int) and st_total > 0 else (int(st_sum) if st_sum > 0 else None)
+        lt_val = int(lt_total) if isinstance(lt_total, int) and lt_total > 0 else (int(lt_sum) if lt_sum > 0 else None)
+        return st_val, lt_val, st_hits + lt_hits
+
+    try:
+        soup = BeautifulSoup(ixbrl_html, "lxml")
+    except Exception:
+        return empty
+
+    best = None
+    best_score = -1
+    for tbl in soup.find_all("table"):
+        ttxt = tbl.get_text(" ", strip=True)
+        if not ttxt:
+            continue
+        if _CF_TABLE_EXCLUDE_RE.search(ttxt):
+            continue
+        near_text = _table_near_text(tbl)
+        if S_OTHER_NOTE in near_text and S_NOTE not in near_text:
+            continue
+        if (S_NOTE not in near_text) and (S_NOTE not in ttxt):
+            continue
+        if (S_NOTE_HEAD not in near_text) and (S_NOTE_HEAD not in ttxt) and (S_NOTE not in near_text):
+            continue
+        if (S_FLOW not in ttxt) or (S_NFLOW not in ttxt):
+            continue
+
+        matrix: list[list[str]] = []
+        for tr in tbl.find_all("tr"):
+            row = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+            if row:
+                matrix.append(row)
+        if len(matrix) < 4:
+            continue
+
+        start_col, end_col = _pick_date_columns(matrix)
+        if start_col is None or end_col is None:
+            continue
+
+        unit, _ = _detect_unit_and_explicit(near_text + " " + ttxt)
+        mul = _yen_unit_multiplier(unit)
+
+        vals_prior: dict[str, int] = {}
+        vals_current: dict[str, int] = {}
+        hits: set[str] = set()
+
+        for row in matrix[1:]:
+            label = _row_label(row)
+            label_norm = _norm_label(label)
+            if not label_norm:
+                continue
+            key = _match_key(label_norm)
+            if key is None:
+                continue
+            prior_cols = [int(start_col), int(start_col) - 1]
+            current_cols = [int(end_col), int(end_col) - 1, int(end_col) + 1]
+            v0 = _row_value_from_candidates(row, prior_cols)
+            v1 = _row_value_from_candidates(row, current_cols)
+            if v0 is not None:
+                vals_prior[key] = int(v0) * mul
+            if v1 is not None:
+                vals_current[key] = int(v1) * mul
+            if v0 is not None or v1 is not None:
+                hits.add(key)
+
+        if not {"st_total", "lt_total"}.issubset(hits):
+            continue
+        short_signals = hits.intersection({"st_loan", "cur_lt_loan", "cur_bond", "cp", "lease_cl", "installment_cl"})
+        long_signals = hits.intersection({"long_loan", "bond_ncl", "lease_ncl", "installment_ncl"})
+        if not short_signals or not long_signals:
+            continue
+
+        prior_st, prior_lt, prior_comp_hits = _resolve(vals_prior, mul)
+        current_st, current_lt, current_comp_hits = _resolve(vals_current, mul)
+        if not ((isinstance(prior_st, int) and isinstance(prior_lt, int)) or (isinstance(current_st, int) and isinstance(current_lt, int))):
+            continue
+
+        score = 0
+        score += 4
+        score += len(short_signals) + len(long_signals)
+        score += 2 if S_NOTE_HEAD in near_text else 0
+        score += 2 if S_FLOW in ttxt and S_NFLOW in ttxt else 0
+        score += min(prior_comp_hits, 4)
+        score += min(current_comp_hits, 4)
+
+        if score > best_score:
+            best_score = score
+            best = {
+                "prior": prior_st,
+                "prior_lt": prior_lt,
+                "current": current_st,
+                "current_lt": current_lt,
+                "_score": score,
+            }
+
     return best if isinstance(best, dict) else empty
 
 def extract_other_financial_liabilities_leases(ixbrl_html: str) -> dict[str, int | None]:
@@ -3496,10 +4301,51 @@ def extract_debt_schedules_from_html(html: str) -> List[dict]:
         # v26_114 regression guard (2502 etc.): Exclude fair value disclosure tables.
         # These tables often have "帳簿価額/公正価値" (or Carrying amount/Fair value) columns and
         # can contain very large numbers that are NOT end balances of borrowings.
-        if re.search(r"(帳簿価額|公正価値|Carrying\s+amount|Fair\s+value)", txt, re.I) or re.search(r"(帳簿価額|公正価値|Carrying\s+amount|Fair\s+value)", header_text, re.I):
+        # v26_168 exception (6005 family): do not drop explicit debt-note tables merely because one row says
+        # "公正価値で測定する金融負債". The real fair-value disclosure tables are identified by fair-value headers.
+        note_detail_row_hint = bool(re.search(
+            r"(短期借入金|１年以内返済予定の長期借入金|1年以内返済予定の長期借入金|"
+            r"１年内返済予定の長期借入金|1年内返済予定の長期借入金|"
+            r"長期借入金|１年以内償還予定の社債|1年以内償還予定の社債|"
+            r"１年内償還予定の社債|1年内償還予定の社債|社債|リース(?:負債|債務))",
+            txt,
+        ))
+        fair_value_header = bool(re.search(r"(帳簿価額|公正価値|Carrying\s+amount|Fair\s+value)", header_text, re.I))
+        fair_value_body = bool(re.search(r"(帳簿価額|公正価値|Carrying\s+amount|Fair\s+value)", txt, re.I))
+        if fair_value_header or (fair_value_body and not note_detail_row_hint):
             continue
         # Require an end-balance style header ("当期末残高" / "期末残高") to avoid picking maturity analyses.
-        if not _HDR_END_RE.search(header_text):
+        # v26_168 regression fix (6005 family):
+        # Some IFRS filers disclose explicit debt-note tables under "その他の金融負債" with only date columns and
+        # rows such as "１年以内返済予定の長期借入金"/"長期借入金", but without "期末残高" wording.
+        # If we reject those tables here, we lose the explicit current-portion loan split and keep lease-only XBRL totals.
+        # Keep this bypass narrow: non-BS, non-maturity tables with explicit debt row labels only.
+        allow_note_detail_without_end_header = False
+        try:
+            if not near_title:
+                note_like_rows = 0
+                for row in matrix[1:]:
+                    if not row:
+                        continue
+                    label = str(row[0] or "").strip()
+                    if not label:
+                        continue
+                    label_n = re.sub(r"\s+", "", label)
+                    if _EXCL_INTEREST_COST_RE.search(label_n):
+                        continue
+                    if re.search(
+                        r"(短期借入金|１年以内返済予定の長期借入金|1年以内返済予定の長期借入金|"
+                        r"１年内返済予定の長期借入金|1年内返済予定の長期借入金|"
+                        r"長期借入金|１年以内償還予定の社債|1年以内償還予定の社債|"
+                        r"１年内償還予定の社債|1年内償還予定の社債|社債|リース(?:負債|債務))",
+                        label_n,
+                    ):
+                        note_like_rows += 1
+                if note_like_rows > 0:
+                    allow_note_detail_without_end_header = True
+        except Exception:
+            allow_note_detail_without_end_header = False
+        if not _HDR_END_RE.search(header_text) and not allow_note_detail_without_end_header:
             continue
         # Exclude maturity bucket tables like "１年以内/２年以内/..." which can contain debt terms but are not schedules of borrowings.
                 # Exclude maturity bucket tables like "１年以内/２年以内/..." which can contain debt terms but are not schedules.
@@ -3575,10 +4421,19 @@ def extract_debt_schedules_from_html(html: str) -> List[dict]:
                 continue
 
             if _LEASE_RE.search(label):
+                # Combined rows like "借入金及びリース負債（流動）" are total debt rows, not pure lease components.
+                # v26_168 regression guard (6702): if we treat them as lease here, leases are double-counted on top of
+                # short loans / CP and totals explode. Keep only pure lease rows in this branch.
+                if _LOAN_RE.search(label) or _BOND_RE.search(label):
+                    continue
                 # Lease: avoid misclassifying a "total lease" row (no 1-year bucket) as NCL.
                 # Only classify when the label clearly indicates short/long bucket.
-                is_short = ("短期" in label) or one_year
-                is_long = ("長期" in label) or exclude_flag or bool(re.search(r"(１年超|1年超|一年超|長期分|LongTerm)", label))
+                # v26_168 regression fix (6702 family):
+                # IFRS schedules often label lease rows as "リース負債（流動）/（非流動）" rather than
+                # "短期/長期". Without recognizing 流動/非流動 here, explicit lease rows are dropped and
+                # only loan/CP components remain.
+                is_short = ("短期" in label) or one_year or (("流動" in label) and ("非流動" not in label))
+                is_long = ("長期" in label) or ("非流動" in label) or exclude_flag or bool(re.search(r"(１年超|1年超|一年超|長期分|LongTerm)", label))
                 if is_long:
                     lt_end["lease_ncl"] = int(lt_end.get("lease_ncl") or 0) + int(v_end)
                     if v_start is not None:
@@ -3618,6 +4473,53 @@ def extract_debt_schedules_from_html(html: str) -> List[dict]:
                         lt_end["long_loan"] = int(lt_end.get("long_loan") or 0) + int(v_end)
                         if v_start is not None:
                             lt_start["long_loan"] = int(lt_start.get("long_loan") or 0) + int(v_start)
+                continue
+
+            if _BORROWINGS_SCHEDULE_OTHER_INTEREST_RE.search(label):
+                # Explicit "other interest-bearing liabilities" rows inside 借入金等明細表.
+                # These are debt by table definition, but they are not matched by the generic loan/bond/lease regexes.
+                # Keep this narrow and schedule-only, otherwise generic BS rows such as 預り金 / その他 would leak in.
+                # Regression note (9022 / JR東海):
+                # labels like "鉄道施設購入長期未払金（１年以内に支払予定のものを除く）" contain both
+                # "長期" and "１年以内", but they are explicitly non-current because of "除く".
+                # Conversely, "１年以内に支払予定の鉄道施設購入長期未払金" contains "長期" yet must stay short-term.
+                # If we classify by raw one_year/長期 presence only, the huge non-current payable leaks into ST and
+                # explodes CP/CR while DB/DD undercount by the same amount. Keep the exclude-vs-due ordering here.
+                label_cls = label_n
+                due_within_year = bool(re.search(r"(１年以内|1年以内|１年内|1年内).*(支払予定|支払う|返済予定|償還予定)", label_cls))
+                is_short = (
+                    (not exclude_flag)
+                    and (
+                        due_within_year
+                        or ("短期" in label_cls)
+                        or ("社内預金" in label_cls)
+                        or ("預り金" in label_cls)
+                        or ("その他の流動負債" in label_cls)
+                        or (("流動" in label_cls) and ("非流動" not in label_cls))
+                        or (one_year and ("長期" not in label_cls) and ("固定" not in label_cls))
+                    )
+                )
+                is_long = (
+                    exclude_flag
+                    or bool(re.search(r"(１年超|1年超)", label_cls))
+                    or ("その他の固定負債" in label_cls)
+                    or (
+                        (("長期" in label_cls) or ("固定" in label_cls) or ("非流動" in label_cls))
+                        and (not due_within_year)
+                    )
+                )
+                if is_long and not is_short:
+                    lt_end["other_interest"] = int(lt_end.get("other_interest") or 0) + int(v_end)
+                    if v_start is not None:
+                        lt_start["other_interest"] = int(lt_start.get("other_interest") or 0) + int(v_start)
+                elif is_short and not is_long:
+                    st_end["other_interest"] = int(st_end.get("other_interest") or 0) + int(v_end)
+                    if v_start is not None:
+                        st_start["other_interest"] = int(st_start.get("other_interest") or 0) + int(v_start)
+                elif is_long:
+                    lt_end["other_interest"] = int(lt_end.get("other_interest") or 0) + int(v_end)
+                    if v_start is not None:
+                        lt_start["other_interest"] = int(lt_start.get("other_interest") or 0) + int(v_start)
                 continue
 
         st_end_raw = sum(v for v in st_end.values() if v is not None) if st_end else None
@@ -4727,9 +5629,18 @@ def extract_lease_liabilities_short_long_table(html: str) -> List[dict]:
         prev = t.find_previous(["h1","h2","h3","h4","h5","h6","p","div"])
         if prev is not None and getattr(prev, "get_text", None):
             ctx = prev.get_text(" ", strip=True) + " " + ctx
-        if _EXCL_UNDISCOUNTED_RE.search(ctx) or _EXCL_CASHFLOW_RE.search(ctx):
+        # v26_168 regression fix (6089 family):
+        # Some IFRS filers disclose a carrying-amount lease row together with explicit "流動/非流動"
+        # rows inside a broader cash-flow table. We can use it only when the carrying total and the split
+        # are both explicit; otherwise keep excluding cash-flow tables.
+        has_carrying_flow_split = (
+            bool(re.search(r"(その他の金融負債に含まれる)?リース(?:負債|債務)残高", ttxt))
+            and ("流動" in ttxt)
+            and ("非流動" in ttxt)
+        )
+        if (_EXCL_UNDISCOUNTED_RE.search(ctx) or _EXCL_CASHFLOW_RE.search(ctx)) and not has_carrying_flow_split:
             continue
-        if _has_near_title(t, "満期分析", max_steps=2200):
+        if _has_near_title(t, "満期分析", max_steps=2200) and not has_carrying_flow_split:
             continue
         if _has_near_title(t, "繰延税金", max_steps=2200) or _EXCL_NON_DEBT_TABLE_RE.search(ctx):
             continue
@@ -4826,12 +5737,22 @@ def extract_lease_liabilities_short_long_table(html: str) -> List[dict]:
             return v
 
         lease_cl = lease_ncl = None
+        lease_total = None
         for r in matrix[1:]:
             label = (r[0] or "").strip()
             if not label:
                 continue
             label_n = re.sub(r"\s+","",label)
             if _EXCL_INTEREST_COST_RE.search(label_n):
+                continue
+            if has_carrying_flow_split and lease_total is None and re.search(r"(その他の金融負債に含まれる)?リース(?:負債|債務)残高", label_n):
+                lease_total = _row_value(r)
+                continue
+            if has_carrying_flow_split and lease_cl is None and re.fullmatch(r"(流動|Current)", label_n, re.I):
+                lease_cl = _row_value(r)
+                continue
+            if has_carrying_flow_split and lease_ncl is None and re.fullmatch(r"(非流動|固定|Non.?current)", label_n, re.I):
+                lease_ncl = _row_value(r)
                 continue
             if lease_cl is None and short_re.search(label):
                 lease_cl = _row_value(r)
@@ -4845,10 +5766,16 @@ def extract_lease_liabilities_short_long_table(html: str) -> List[dict]:
         lease_ncl_y = int(lease_ncl) * mul
         if lease_cl_y <= 0 or lease_ncl_y <= 0:
             continue
+        if lease_total not in (None, 0):
+            lease_total_y = int(lease_total) * mul
+            if abs(int(lease_total_y) - (int(lease_cl_y) + int(lease_ncl_y))) > 2 * mul:
+                continue
 
         score = 0
         score += 2 if unit_explicit else 0
         score += 2  # both rows found
+        if lease_total not in (None, 0):
+            score += 2
         out.append({
             "lease_cl_yen": int(lease_cl_y),
             "lease_ncl_yen": int(lease_ncl_y),
@@ -5140,9 +6067,19 @@ def _apply_html_additive_adjustment_for_asr(
     xbrl_cp_cl = x.get("cp_cl")
     xbrl_call_money_cl = x.get("call_money_cl")
     xbrl_lease_cl = x.get("lease_cl")
+    xbrl_explicit_lt_debt_cl = x.get("explicit_lt_debt_cl")
+    xbrl_sched_other_st_known = sum_nullable(
+        x.get("fluidity_payables_cl"),
+        x.get("railway_eq_payables_cl"),
+    )
     xbrl_loans_ncl = x.get("loans_ncl")
     xbrl_bonds_ncl = x.get("bonds_ncl")
     xbrl_lease_ncl = x.get("lease_ncl")
+    xbrl_explicit_lt_debt_ncl = x.get("explicit_lt_debt_ncl")
+    xbrl_sched_other_lt_known = sum_nullable(
+        x.get("fluidity_payables_ncl"),
+        x.get("railway_eq_payables_ncl"),
+    )
 
     # v26_107: Pre-extract strict supplements that may live outside HTML <table> schedules.
     # - lease_due_best: lease liabilities due buckets (<=1y / >1y) from lease notes
@@ -5404,9 +6341,29 @@ def _apply_html_additive_adjustment_for_asr(
             pen = 0
             # Penalize schedules that miss required components when XBRL has them.
             LARGE_MISS = 10**12
-            if xbrl_loans_ncl not in (None, 0):
+            if (xbrl_loans_ncl not in (None, 0)) or (xbrl_explicit_lt_debt_ncl not in (None, 0)):
                 if comp_yen.get("long_loan") not in (None, 0):
-                    pen += abs(int(xbrl_loans_ncl) - int(comp_yen["long_loan"]))
+                    diffs = []
+                    try:
+                        if xbrl_loans_ncl not in (None, 0):
+                            diffs.append(abs(int(xbrl_loans_ncl) - int(comp_yen["long_loan"])))
+                        explicit_loan_ref = sum_nullable(xbrl_loans_ncl, xbrl_explicit_lt_debt_ncl)
+                        if explicit_loan_ref not in (None, 0):
+                            # Regression note (9022 / JR東海):
+                            # some filers tag a massive long-term borrowing block (e.g. 中央新幹線建設長期借入金)
+                            # outside generic loans_ncl. When we compare the schedule's "long_loan" only against
+                            # loans_ncl, the correct borrowings schedule loses to a partial table and we then miss
+                            # other_interest / lease_ncl add-backs. Accept the combined explicit loan base here.
+                            diffs.append(abs(int(explicit_loan_ref) - int(comp_yen["long_loan"])))
+                    except Exception:
+                        diffs = []
+                    if diffs:
+                        md = min(diffs)
+                        if md <= COMP_MATCH_TOL_YEN:
+                            md = 0
+                        pen += md
+                    else:
+                        pen += LARGE_MISS
                 else:
                     pen += LARGE_MISS
             if (not lease_excluded) and (xbrl_lease_ncl not in (None, 0)):
@@ -5479,14 +6436,35 @@ def _apply_html_additive_adjustment_for_asr(
                     st_html_yen['cur_bond'] = int(bond_text_best['bonds_cl_yen'])
         except Exception:
             pass
-        if (st_html_yen.get("cur_bond") in (None, 0)) and (xbrl_bonds_cl in (None, 0)):
-            bond_cands: List[dict] = []
-            for h in html_candidates:
-                bond_cands.extend(extract_bond_maturity_1y_from_html(h))
-            if bond_cands:
-                bond_1y_yen = int(bond_cands[0].get("yen_1y") or 0)
-                if bond_1y_yen <= 0:
-                    bond_1y_yen = None
+        bond_cands: List[dict] = []
+        for h in html_candidates:
+            bond_cands.extend(extract_bond_maturity_1y_from_html(h))
+        if bond_cands:
+            bond_1y_yen = int(bond_cands[0].get("yen_1y") or 0)
+            if bond_1y_yen <= 0:
+                bond_1y_yen = None
+        # Regression note (9022 / JR東海 2024-03-31):
+        # some filings tag total bonds correctly but split current/non-current slightly differently from the
+        # explicit "1年以内" maturity table. When the explicit current bond amount is available, re-split the
+        # XBRL bond components WITHOUT changing the total bonds amount. This fixes tiny short/long allocation
+        # gaps (e.g. 80,504/709,337 -> 80,512/709,329) while keeping aggregate debt unchanged.
+        try:
+            if (
+                bond_1y_yen not in (None, 0)
+                and xbrl_bonds_cl not in (None, 0)
+                and xbrl_bonds_ncl not in (None, 0)
+            ):
+                bonds_total = int(xbrl_bonds_cl) + int(xbrl_bonds_ncl)
+                bond_ncl_from_1y = bonds_total - int(bond_1y_yen)
+                if bond_ncl_from_1y >= 0 and abs(int(xbrl_bonds_cl) - int(bond_1y_yen)) > COMP_MATCH_TOL_YEN:
+                    if xbrl_st not in (None, 0):
+                        xbrl_st = int(xbrl_st) - int(xbrl_bonds_cl) + int(bond_1y_yen)
+                    if xbrl_lt not in (None, 0):
+                        xbrl_lt = int(xbrl_lt) - int(xbrl_bonds_ncl) + int(bond_ncl_from_1y)
+                    xbrl_bonds_cl = int(bond_1y_yen)
+                    xbrl_bonds_ncl = int(bond_ncl_from_1y)
+        except Exception:
+            pass
         # v26_107: Bonds payable may appear only in '社債明細表' TextBlock (non-table).
         # Use it only when both XBRL and schedule miss current bonds (double-count guard).
         try:
@@ -5507,7 +6485,7 @@ def _apply_html_additive_adjustment_for_asr(
                 continue
             if vv not in (None, 0):
                 st_sched_total += int(vv)
-        if bond_1y_yen not in (None, 0):
+        if bond_1y_yen not in (None, 0) and st_html_yen.get("cur_bond") in (None, 0):
             st_sched_total += int(bond_1y_yen)
         if st_sched_total > 0:
             out["short_term_borrowings_sched_current"] = int(st_sched_total)
@@ -5530,75 +6508,143 @@ def _apply_html_additive_adjustment_for_asr(
         loans_sum_matches = _close(xbrl_loans_cl, html_loans_sum)
 
         missing_add = 0
+        explicit_loan_add_st = 0
         loan_split_added_st = 0
         if (not lease_excluded) and st_html_yen.get("lease") not in (None, 0) and (xbrl_lease_cl in (None, 0)):
             missing_add += int(st_html_yen["lease"])
+        # v26_168 regression fix (6005 family):
+        # When XBRL short-term borrowings are missing but the note table explicitly discloses
+        # short loans and/or the current portion of long-term loans, add the explicit loan rows.
+        # Without this, IFRS filers where XBRL carries only lease/current-nonloan components stay understated.
+        loans_sum_added_st = bool(html_loans_sum not in (None, 0) and (xbrl_loans_cl in (None, 0)))
+        if loans_sum_added_st:
+            missing_add += int(html_loans_sum)
+            explicit_loan_add_st += int(html_loans_sum)
         # v26_158 (general; 5830 regression family):
         # Some bank ASRs disclose aggregate "借入金" in the borrowings schedule and the <=1y split in a
         # separate maturity-bucket table under the same 【借入金等明細表】 heading. The generic schedule parser
         # correctly avoids guessing from the aggregate row, so add the strict split here only when the schedule
         # itself has no explicit short-loan/current-portion rows and XBRL loan components are missing.
+        ibl_already_covers_loan_split_st = False
+        try:
+            # IFRS regression guard (7111 family):
+            # InterestBearingLiabilitiesCLIFRS can already be the consolidated loan subtotal even when
+            # xbrl_loans_cl itself is missing. In that case adding loan_due_split_best again duplicates
+            # the short-term loan portion on top of the existing total.
+            if loan_due_split_best and ibl_cl not in (None, 0) and (loan_due_split_best.get("loan_cl_yen") not in (None, 0)):
+                nonloan_known_st = 0
+                for vv in (
+                    xbrl_bonds_cl,
+                    xbrl_cp_cl,
+                    xbrl_lease_cl,
+                    xbrl_explicit_lt_debt_cl,
+                    xbrl_sched_other_st_known,
+                ):
+                    if vv not in (None, 0):
+                        nonloan_known_st += int(vv)
+                if _close(int(ibl_cl), int(loan_due_split_best["loan_cl_yen"])):
+                    if xbrl_st in (None, 0) or _close(int(xbrl_st), int(ibl_cl) + int(nonloan_known_st)):
+                        ibl_already_covers_loan_split_st = True
+        except Exception:
+            ibl_already_covers_loan_split_st = False
         if (
             loan_due_split_best
             and (xbrl_loans_cl in (None, 0))
             and (loan_due_split_best.get("loan_cl_yen") not in (None, 0))
             and (st_html_yen.get("short_loan") in (None, 0))
             and (st_html_yen.get("cur_lt_loan") in (None, 0))
+            and (not ibl_already_covers_loan_split_st)
         ):
             missing_add += int(loan_due_split_best["loan_cl_yen"])
             loan_split_added_st = int(loan_due_split_best["loan_cl_yen"])
+            explicit_loan_add_st = max(int(explicit_loan_add_st), int(loan_split_added_st))
         if st_html_yen.get("cp") not in (None, 0) and (xbrl_cp_cl in (None, 0)):
             missing_add += int(st_html_yen["cp"])
         if st_html_yen.get("cur_bond") not in (None, 0) and (xbrl_bonds_cl in (None, 0)):
             missing_add += int(st_html_yen["cur_bond"])
-        if bond_1y_yen not in (None, 0):
+        if bond_1y_yen not in (None, 0) and (xbrl_bonds_cl in (None, 0)) and (st_html_yen.get("cur_bond") in (None, 0)):
             missing_add += int(bond_1y_yen)
-        if (not loans_sum_matches) and st_html_yen.get("cur_lt_loan") not in (None, 0):
+        html_other_st = st_html_yen.get("other_interest")
+        if html_other_st not in (None, 0):
+            other_known_st = int(xbrl_sched_other_st_known or 0)
+            other_missing_st = max(int(html_other_st) - other_known_st, 0)
+            if other_missing_st > COMP_MATCH_TOL_YEN:
+                known_base_st = 0
+                for vv in (
+                    xbrl_loans_cl,
+                    xbrl_bonds_cl,
+                    xbrl_cp_cl,
+                    xbrl_lease_cl,
+                    xbrl_explicit_lt_debt_cl,
+                    xbrl_sched_other_st_known,
+                ):
+                    if vv not in (None, 0):
+                        known_base_st += int(vv)
+                if (xbrl_st in (None, 0)) or (known_base_st > 0 and _close(int(xbrl_st), int(known_base_st))):
+                    missing_add += int(other_missing_st)
+        if (not loans_sum_matches) and (not loans_sum_added_st) and st_html_yen.get("cur_lt_loan") not in (None, 0):
             # Add current portion of long-term loans when it is NOT already included in XBRL current borrowings.
             xbrl_cur_port = first_value(v_full, v_local, ST_BORROWINGS_CURRENT_PORTION_CONCEPTS, debt_ctx)
             if xbrl_cur_port in (None, 0):
                 sch_short = st_html_yen.get("short_loan")
                 if (sch_short not in (None, 0)) and _close(xbrl_loans_cl, sch_short):
                     missing_add += int(st_html_yen["cur_lt_loan"])
+                    explicit_loan_add_st += int(st_html_yen["cur_lt_loan"])
                 elif xbrl_loans_cl in (None, 0):
                     missing_add += int(st_html_yen["cur_lt_loan"])
+                    explicit_loan_add_st += int(st_html_yen["cur_lt_loan"])
 
         if missing_add > 0:
             base = int(xbrl_st) if xbrl_st is not None else 0
             new_st = base + missing_add
-            loan_split_nonloan_match_st = False
-            # Bank ASR pattern (5831/5832 family):
-            # xbrl_st may contain only non-loan short-term debt (e.g., call money) while the large "借入金" split
-            # is available explicitly only in 借入金等明細表 + maturity bucket. In that case ratio guards reject
-            # the valid add-back. Allow only when xbrl_st is explainable by non-loan components.
-            if loan_split_added_st > 0 and xbrl_st not in (None, 0):
+            loan_base_matches_nonloan_add_st = False
+            try:
+                nonloan_add_st = 0
+                if html_loans_sum not in (None, 0) and _close(xbrl_loans_cl, html_loans_sum):
+                    if (not lease_excluded) and st_html_yen.get("lease") not in (None, 0) and (xbrl_lease_cl in (None, 0)):
+                        nonloan_add_st += int(st_html_yen["lease"])
+                    if st_html_yen.get("cp") not in (None, 0) and (xbrl_cp_cl in (None, 0)):
+                        nonloan_add_st += int(st_html_yen["cp"])
+                    if st_html_yen.get("cur_bond") not in (None, 0) and (xbrl_bonds_cl in (None, 0)):
+                        nonloan_add_st += int(st_html_yen["cur_bond"])
+                    if bond_1y_yen not in (None, 0) and st_html_yen.get("cur_bond") in (None, 0):
+                        nonloan_add_st += int(bond_1y_yen)
+                    if nonloan_add_st > 0:
+                        loan_base_matches_nonloan_add_st = True
+            except Exception:
+                loan_base_matches_nonloan_add_st = False
+            explicit_loan_nonloan_match_st = False
+            # Bank ASR pattern (5831/5832 family) and IFRS note-detail pattern (6005 family):
+            # xbrl_st may contain only non-loan short-term debt (lease/CP/bonds), while the explicit
+            # short-loan/current-portion split lives only in the schedule or note table. In that case ratio guards
+            # would reject the valid loan add-back. Allow it only when xbrl_st is fully explainable by non-loan items.
+            if explicit_loan_add_st > 0 and xbrl_st not in (None, 0):
                 try:
                     nonloan_base = 0
                     if xbrl_bonds_cl not in (None, 0):
                         nonloan_base += int(xbrl_bonds_cl)
                     if xbrl_cp_cl not in (None, 0):
                         nonloan_base += int(xbrl_cp_cl)
-                    if xbrl_call_money_cl not in (None, 0):
-                        nonloan_base += int(xbrl_call_money_cl)
                     if xbrl_lease_cl not in (None, 0):
                         nonloan_base += int(xbrl_lease_cl)
                     if nonloan_base > 0 and _close(int(xbrl_st), int(nonloan_base)):
-                        loan_split_nonloan_match_st = True
+                        explicit_loan_nonloan_match_st = True
                 except Exception:
-                    loan_split_nonloan_match_st = False
-            if (xbrl_st is None) or (new_st <= int(xbrl_st) * HTML_ADD_MAX_RATIO_ST) or loan_split_nonloan_match_st:
+                    explicit_loan_nonloan_match_st = False
+            if (xbrl_st is None) or (new_st <= int(xbrl_st) * HTML_ADD_MAX_RATIO_ST) or explicit_loan_nonloan_match_st or loan_base_matches_nonloan_add_st:
                 cur_liab = first_value(v_full, v_local, BS_FIELDS["current_liabilities"], debt_ctx)
                 if cur_liab is None or new_st <= int(cur_liab) + DEBT_SANITY_MARGIN_YEN:
                     out["short_term_borrowings_current"] = new_st
-                    if loan_split_added_st > 0:
+                    out["st_total_current"] = int(new_st)
+                    if explicit_loan_add_st > 0:
                         if out.get("loans_cl_current") in (None, 0):
-                            out["loans_cl_current"] = int(loan_split_added_st)
-                        out["st_total_current"] = int(new_st)
+                            out["loans_cl_current"] = int(explicit_loan_add_st)
         # If only CP was adjusted (no missing_add), still update using the adjusted total.
         if (cp_adjusted or lease_adjusted) and (missing_add <= 0) and (xbrl_st not in (None, 0)):
             cur_liab = first_value(v_full, v_local, BS_FIELDS["current_liabilities"], debt_ctx)
             if cur_liab is None or int(xbrl_st) <= int(cur_liab) + DEBT_SANITY_MARGIN_YEN:
                 out["short_term_borrowings_current"] = int(xbrl_st)
+                out["st_total_current"] = int(xbrl_st)
 
     # Long-term
     if lt_sch:
@@ -5616,6 +6662,7 @@ def _apply_html_additive_adjustment_for_asr(
                 and (xbrl_bonds_cl in (None, 0))
                 and (xbrl_bonds_ncl not in (None, 0))
                 and (lt_html_yen.get("bond_ncl") in (None, 0))
+                and (lt_html_yen.get("long_loan") in (None, 0))
                 and int(bond_1y_yen) > 0
                 and int(xbrl_bonds_ncl) > int(bond_1y_yen)
             ):
@@ -5647,6 +6694,67 @@ def _apply_html_additive_adjustment_for_asr(
         try:
             if bond_text_best and (lt_html_yen.get("bond_ncl") in (None, 0)) and (xbrl_bonds_ncl in (None, 0)) and (bond_text_best.get("bonds_ncl_yen") not in (None, 0)):
                 lt_html_yen["bond_ncl"] = int(bond_text_best["bonds_ncl_yen"])
+        except Exception:
+            pass
+        # Regression guard (8388 family):
+        # Some filings expose the bond TOTAL in the noncurrent bond row, while a separate bond-maturity
+        # parser explicitly finds the <=1y amount. If we keep the unsplit total here, long-term debt is
+        # overstated by exactly the current portion even though the filing itself gave the split.
+        # Apply only when:
+        # - an explicit bond_1y_yen exists,
+        # - current bonds are otherwise absent in XBRL,
+        # - the current-bond row and the 1y-maturity row are on the same scale, and
+        # - the LT total is explainable including the unsplit bond amount.
+        # This is a re-bucketing of an explicit amount, not an estimate.
+        #
+        # Do NOT loosen the scale-match guard below.
+        # 9502 regression:
+        # some IFRS notes show a carrying-amount current-bond row and, separately, a much larger
+        # contractual/cash-flow "1年以内" amount. Those are different disclosure bases. If we rebucket
+        # LT using the larger maturity figure, long-term debt is understated by exactly that amount.
+        # The guard keeps the 8388-family fix (same-scale rows) without corrupting 9502-family filings.
+        try:
+            html_bond_ncl = lt_html_yen.get("bond_ncl")
+            html_cur_bond = st_html_yen.get("cur_bond")
+            bond_scale_match = False
+            try:
+                if html_cur_bond not in (None, 0) and bond_1y_yen not in (None, 0):
+                    smaller = min(int(html_cur_bond), int(bond_1y_yen))
+                    larger = max(int(html_cur_bond), int(bond_1y_yen))
+                    if smaller > 0 and larger <= smaller * 4:
+                        bond_scale_match = True
+            except Exception:
+                bond_scale_match = False
+            if (
+                bond_1y_yen not in (None, 0)
+                and xbrl_bonds_cl in (None, 0)
+                and html_cur_bond not in (None, 0)
+                and (st_html_yen.get("short_loan") in (None, 0))
+                and (st_html_yen.get("cur_lt_loan") in (None, 0))
+                and (lt_html_yen.get("long_loan") in (None, 0))
+                and bond_scale_match
+                and (not _close(int(st_html_yen.get("cur_bond") or 0), int(bond_1y_yen)))
+                and html_bond_ncl not in (None, 0)
+                and int(html_bond_ncl) > int(bond_1y_yen)
+            ):
+                bond_total_like = False
+                if xbrl_lt in (None, 0):
+                    bond_total_like = True
+                else:
+                    comp_no_bond = 0
+                    if xbrl_loans_ncl not in (None, 0):
+                        comp_no_bond += int(xbrl_loans_ncl)
+                    if xbrl_lease_ncl not in (None, 0):
+                        comp_no_bond += int(xbrl_lease_ncl)
+                    if _close(int(xbrl_lt), comp_no_bond + int(html_bond_ncl)):
+                        bond_total_like = True
+                if bond_total_like:
+                    lt_html_yen["bond_ncl"] = max(int(html_bond_ncl) - int(bond_1y_yen), 0)
+                    if xbrl_bonds_ncl not in (None, 0) and _close(int(xbrl_bonds_ncl), int(html_bond_ncl)):
+                        xbrl_bonds_cl = int(bond_1y_yen)
+                        xbrl_bonds_ncl = max(int(xbrl_bonds_ncl) - int(bond_1y_yen), 0)
+                        if xbrl_lt not in (None, 0):
+                            xbrl_lt = max(int(xbrl_lt) - int(bond_1y_yen), 0)
         except Exception:
             pass
         # If XBRL lease noncurrent appears inconsistent with schedule lease_ncl, adjust total by replacement.
@@ -5709,6 +6817,7 @@ def _apply_html_additive_adjustment_for_asr(
             pass
 
         missing_add = 0
+        explicit_loan_add_lt = 0
         loan_split_added_lt = 0
         add_lease = (lt_html_yen.get("lease_ncl") not in (None, 0) and (xbrl_lease_ncl in (None, 0)))
         # v26_107 regression guard: Do NOT add bond_ncl just because XBRL bond component is missing.
@@ -5732,16 +6841,54 @@ def _apply_html_additive_adjustment_for_asr(
             missing_add += int(lt_html_yen["lease_ncl"])
         if add_bond:
             missing_add += int(lt_html_yen["bond_ncl"])
+        html_other_lt = lt_html_yen.get("other_interest")
+        if html_other_lt not in (None, 0):
+            other_known_lt = int(xbrl_sched_other_lt_known or 0)
+            other_missing_lt = max(int(html_other_lt) - other_known_lt, 0)
+            if other_missing_lt > COMP_MATCH_TOL_YEN:
+                known_base_lt = 0
+                for vv in (
+                    xbrl_loans_ncl,
+                    xbrl_bonds_ncl,
+                    xbrl_lease_ncl,
+                    xbrl_explicit_lt_debt_ncl,
+                    xbrl_sched_other_lt_known,
+                ):
+                    if vv not in (None, 0):
+                        known_base_lt += int(vv)
+                if (xbrl_lt in (None, 0)) or (known_base_lt > 0 and _close(int(xbrl_lt), int(known_base_lt))):
+                    missing_add += int(other_missing_lt)
+        ibl_already_covers_loan_split_lt = False
+        try:
+            # Same regression family as the short-term guard above.
+            if loan_due_split_best and ibl_ncl not in (None, 0) and (loan_due_split_best.get("loan_ncl_yen") not in (None, 0)):
+                nonloan_known_lt = 0
+                for vv in (
+                    xbrl_bonds_ncl,
+                    xbrl_lease_ncl,
+                    xbrl_explicit_lt_debt_ncl,
+                    xbrl_sched_other_lt_known,
+                ):
+                    if vv not in (None, 0):
+                        nonloan_known_lt += int(vv)
+                if _close(int(ibl_ncl), int(loan_due_split_best["loan_ncl_yen"])):
+                    if xbrl_lt in (None, 0) or _close(int(xbrl_lt), int(ibl_ncl) + int(nonloan_known_lt)):
+                        ibl_already_covers_loan_split_lt = True
+        except Exception:
+            ibl_already_covers_loan_split_lt = False
         if (
             loan_due_split_best
             and (xbrl_loans_ncl in (None, 0))
             and (loan_due_split_best.get("loan_ncl_yen") not in (None, 0))
             and (lt_html_yen.get("long_loan") in (None, 0))
+            and (not ibl_already_covers_loan_split_lt)
         ):
             missing_add += int(loan_due_split_best["loan_ncl_yen"])
             loan_split_added_lt = int(loan_due_split_best["loan_ncl_yen"])
-        if lt_html_yen.get("long_loan") not in (None, 0) and xbrl_loans_ncl is None:
+            explicit_loan_add_lt = max(int(explicit_loan_add_lt), int(loan_split_added_lt))
+        if lt_html_yen.get("long_loan") not in (None, 0) and xbrl_loans_ncl in (None, 0):
             missing_add += int(lt_html_yen["long_loan"])
+            explicit_loan_add_lt += int(lt_html_yen["long_loan"])
 
         if missing_add > 0:
             base = int(xbrl_lt) if xbrl_lt is not None else 0
@@ -5758,7 +6905,7 @@ def _apply_html_additive_adjustment_for_asr(
             # In that case xbrl_lt is intentionally much smaller than the corrected LT total, so the
             # ratio guard would reject a valid explicit split. Allow the add only when xbrl_lt is
             # explainable by non-loan components (bonds/lease) and the loan split is explicit.
-            if loan_split_added_lt > 0 and xbrl_lt not in (None, 0):
+            if explicit_loan_add_lt > 0 and xbrl_lt not in (None, 0):
                 try:
                     nonloan_base = 0
                     if xbrl_bonds_ncl not in (None, 0):
@@ -5773,20 +6920,21 @@ def _apply_html_additive_adjustment_for_asr(
             max_ratio = HTML_ADD_MAX_RATIO_LT_RELAXED if (add_lease or add_bond) else HTML_ADD_MAX_RATIO_LT_DEFAULT
             if (loans_match and (add_lease or add_bond)) or loan_split_nonloan_match:
                 out["long_term_borrowings_current"] = new_lt
-                if loan_split_added_lt > 0:
+                out["lt_total_current"] = int(new_lt)
+                if explicit_loan_add_lt > 0:
                     if out.get("loans_ncl_current") in (None, 0):
-                        out["loans_ncl_current"] = int(loan_split_added_lt)
-                    out["lt_total_current"] = int(new_lt)
+                        out["loans_ncl_current"] = int(explicit_loan_add_lt)
             elif xbrl_lt is None or new_lt <= int(xbrl_lt) * max_ratio:
                 out["long_term_borrowings_current"] = new_lt
-                if loan_split_added_lt > 0:
+                out["lt_total_current"] = int(new_lt)
+                if explicit_loan_add_lt > 0:
                     if out.get("loans_ncl_current") in (None, 0):
-                        out["loans_ncl_current"] = int(loan_split_added_lt)
-                    out["lt_total_current"] = int(new_lt)
+                        out["loans_ncl_current"] = int(explicit_loan_add_lt)
 
     # If only a tiny bonds_ncl was dropped (no missing_add), still update using the adjusted total.
     if lt_sch and lt_bond_dropped and (missing_add <= 0) and (xbrl_lt not in (None, 0)):
         out["long_term_borrowings_current"] = int(xbrl_lt)
+        out["lt_total_current"] = int(xbrl_lt)
 
     # Bond maturity schedule 1y add（cur_bond が無い場合のみ）
     cur_bond_present = (xbrl_bonds_cl not in (None, 0))
@@ -5807,7 +6955,9 @@ def _apply_html_additive_adjustment_for_asr(
             stc = st_sch.get("st_end_components") or {}
             st_comp_yen = _component_dict_to_yen(stc, unit_hint)
             st_sum = 0
-            for vv in st_comp_yen.values():
+            for kk, vv in st_comp_yen.items():
+                if kk == "call_money":
+                    continue
                 if vv not in (None, 0):
                     st_sum += int(vv)
 
@@ -5832,6 +6982,22 @@ def _apply_html_additive_adjustment_for_asr(
 
             if isinstance(st_total_raw_yen, int) and st_total_raw_yen >= 0:
                 try:
+                    # Bank ASR regression guard (8343/8359/8365/8381/8388 family):
+                    # loan_due_split_best can already hold the explicit consolidated loan split from
+                    # the borrowings schedule + maturity buckets, while st_sch may be a partial
+                    # lease-only / bond-only table from the same filing. If we let that partial
+                    # schedule overwrite here, the correct consolidated total is clobbered back to
+                    # a tiny NonConsolidatedMember-like value.
+                    has_explicit_short_loan_split = bool(
+                        loan_due_split_best and (loan_due_split_best.get("loan_cl_yen") not in (None, 0))
+                    )
+                    st_sched_lacks_loan_rows = (
+                        st_comp_yen.get("short_loan") in (None, 0)
+                        and st_comp_yen.get("cur_lt_loan") in (None, 0)
+                        and st_comp_yen.get("other_interest") in (None, 0)
+                    )
+                    if has_explicit_short_loan_split and st_sched_lacks_loan_rows:
+                        raise ValueError("skip_partial_noncon_st_schedule_override")
                     # internal consistency: raw close to component sum (raw may omit bonds; check against st_sum)
                     if st_sum > 0 and abs(int(st_total_raw_yen) - int(st_sum)) <= max(COMP_MATCH_TOL_YEN, 10_000_000):
                         cur_liab = first_value(v_full, v_local, BS_FIELDS["current_liabilities"], debt_ctx)
@@ -5860,6 +7026,18 @@ def _apply_html_additive_adjustment_for_asr(
 
             if isinstance(lt_total_raw_yen, int) and lt_total_raw_yen >= 0:
                 try:
+                    # Same regression family as the short-term guard above.
+                    # When the strict loan split already exposed consolidated long-term loans,
+                    # do not let a partial generic schedule (lease-only / bond-only) overwrite it.
+                    has_explicit_long_loan_split = bool(
+                        loan_due_split_best and (loan_due_split_best.get("loan_ncl_yen") not in (None, 0))
+                    )
+                    lt_sched_lacks_loan_rows = (
+                        lt_comp_yen.get("long_loan") in (None, 0)
+                        and lt_comp_yen.get("other_interest") in (None, 0)
+                    )
+                    if has_explicit_long_loan_split and lt_sched_lacks_loan_rows:
+                        raise ValueError("skip_partial_noncon_lt_schedule_override")
                     if lt_sum > 0 and abs(int(lt_total_raw_yen) - int(lt_sum)) <= max(COMP_MATCH_TOL_YEN, 10_000_000):
                         out["long_term_borrowings_current"] = int(lt_sched)
                 except Exception:
@@ -5972,10 +7150,16 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
         + BONDS_CL_TOTAL_CONCEPTS + BONDS_NCL_TOTAL_CONCEPTS
         + LEASE_CL_TOTAL_CONCEPTS + LEASE_CL_COMPONENT_CONCEPTS + LEASE_NCL_TOTAL_CONCEPTS + LEASE_NCL_COMPONENT_CONCEPTS
         + COMMERCIAL_PAPERS_CL_CONCEPTS
-        + SHARES_CONCEPTS
         + CASH_EQ_ST_INV_TRUE_TOTAL_CONCEPTS + CASH_DEPOSITS_CONCEPTS + CASH_EQ_FALLBACK_CONCEPTS
         + CASH_EQ_CALL_LOANS_CONCEPTS + CASH_EQ_NONOP_SECURITIES_TOTAL_CONCEPTS + CASH_EQ_OPERATIONAL_SECURITIES_CONCEPTS
     )
+    # v26_167:
+    # Do NOT include SHARES_CONCEPTS in BS context selection.
+    # FilingDateInstant often carries multiple share facts; once shares were added here, choose_bs_contexts()
+    # started selecting filing-date instants as "current BS" for some SSR/ASR filings (e.g. 6301, 6645, 6702),
+    # which shifted period_end to the filing date and broke debt extraction / quarter mapping.
+    # Shares are now extracted via extract_shares() with cross-context fallback, so they no longer need to
+    # influence the BS context scorer.
     bs_local = set(local_name(x) for x in (bs_full | extra_full))
 
     prior_date_str, prior_ctx, cur_date_str, cur_ctx = choose_bs_contexts(
@@ -5986,18 +7170,26 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
     # Extract 4-digit security code (ticker) from DEI when available.
     # Used only for explicitly allowed ticker exception(s). Do NOT generalize.
     code4 = None
+    security_code_raw = None
     try:
         for f in facts:
             if local_name(getattr(f, "name", "") or "") == "SecurityCodeDEI":
-                code4 = _extract_code4(getattr(f, "txt", "") or "")
+                security_code_raw = (getattr(f, "txt", "") or "").strip()
+                code4 = _extract_code4(security_code_raw)
                 break
     except Exception:
         code4 = None
+        security_code_raw = None
 
     out: Dict[str, object] = {
         "bs_prior_date": prior_date_str,
         "bs_current_date": cur_date_str,
         "fy_end_month": extract_fy_end_month_from_dei(facts),
+        # Offline regression suites often use generic ZIP filenames. Exposing SecurityCodeDEI here lets
+        # build_edinet_store_from_regression_suite() recover the ticker even when the path itself has no code.
+        # Do NOT remove unless you re-check the user's EDINET folder workflow end-to-end.
+        "security_code4": code4,
+        "security_code": security_code_raw,
     }
 
     for field, concepts in BS_FIELDS.items():
@@ -6079,7 +7271,12 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
         out[f"nr_st_loans_{suffix}"] = nr_st
         out[f"nr_lt_loans_{suffix}"] = nr_lt_loan
         out[f"nr_lt_bonds_{suffix}"] = nr_lt_bond
-        for k in ["loans_cl", "bonds_cl", "cp_cl", "lease_cl", "st_total", "loans_ncl", "bonds_ncl", "lease_ncl", "lt_total"]:
+        for k in [
+            "loans_cl", "bonds_cl", "cp_cl", "call_money_cl", "lease_cl", "st_total",
+            "fluidity_payables_cl", "railway_eq_payables_cl", "explicit_lt_debt_cl",
+            "loans_ncl", "bonds_ncl", "lease_ncl", "lt_total",
+            "fluidity_payables_ncl", "railway_eq_payables_ncl", "explicit_lt_debt_ncl",
+        ]:
             out[f"{k}_{suffix}"] = comps.get(k)
 
     out["short_term_borrowings_prior"] = out.get("st_total_prior")
@@ -6097,8 +7294,18 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
     out["_lt_sched_has_lease_ncl_current"] = False  # schedule includes lease_ncl component
     out["_lt_sched_has_lease_ncl_prior"] = False
 
-    out["shares_outstanding_prior"] = extract_shares(v_full, v_local, prior_ctx)
-    out["shares_outstanding_current"] = extract_shares(v_full, v_local, cur_ctx)
+    out["shares_outstanding_prior"] = extract_shares(
+        v_full, v_local, prior_ctx,
+        ctx_info=ctx_info,
+        target_date=prior_d,
+        prefer_current_fallback=False,
+    )
+    out["shares_outstanding_current"] = extract_shares(
+        v_full, v_local, cur_ctx,
+        ctx_info=ctx_info,
+        target_date=cur_d,
+        prefer_current_fallback=True,
+    )
 
     # ASRのみHTML補完（既存安定版）
     if (doc_kind or "").strip().upper() == "ASR" and html_candidates and cur_ctx_debt:
@@ -6111,6 +7318,56 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
         out["asu2016_02_lease_excluded"] = bool(lease_excluded)
 
         _apply_html_additive_adjustment_for_asr(out, v_full, v_local, cur_ctx_debt, html_candidates, lease_excluded=lease_excluded)
+
+    # -----------------------------------------------------------------
+    # IFRS duplication guard (7111 family):
+    # Some ASR filings expose loan subtotals via InterestBearingLiabilities*IFRS and lease liabilities separately,
+    # but a later reconciliation path can leave st_total / lt_total as:
+    #   short = loans_cl + loans_cl + lease_cl
+    #   long  = loans_ncl + loans_ncl + lease_ncl
+    # This creates a false WARN even though the correct debt total is simply loans + lease.
+    #
+    # Keep the guard exact:
+    # - require an explicit lease component,
+    # - require no call-money component / CP / bonds on that side,
+    # - require the total to match the duplicated pattern within tolerance.
+    # Do NOT relax this to generic ratio logic, or bank short-term debt totals will be damaged again.
+    # -----------------------------------------------------------------
+    try:
+        for suffix in ("prior", "current"):
+            loans_cl_v = out.get(f"loans_cl_{suffix}")
+            lease_cl_v = out.get(f"lease_cl_{suffix}")
+            st_total_v = out.get(f"st_total_{suffix}")
+            if (
+                loans_cl_v not in (None, 0)
+                and lease_cl_v not in (None, 0)
+                and out.get(f"call_money_cl_{suffix}") in (None, 0)
+                and out.get(f"cp_cl_{suffix}") in (None, 0)
+                and out.get(f"bonds_cl_{suffix}") in (None, 0)
+                and st_total_v not in (None, 0)
+            ):
+                dup_st = int(loans_cl_v) * 2 + int(lease_cl_v)
+                corr_st = int(loans_cl_v) + int(lease_cl_v)
+                if abs(int(st_total_v) - dup_st) <= COMP_MATCH_TOL_YEN:
+                    out[f"st_total_{suffix}"] = corr_st
+                    out[f"short_term_borrowings_{suffix}"] = corr_st
+
+            loans_ncl_v = out.get(f"loans_ncl_{suffix}")
+            lease_ncl_v = out.get(f"lease_ncl_{suffix}")
+            lt_total_v = out.get(f"lt_total_{suffix}")
+            if (
+                loans_ncl_v not in (None, 0)
+                and lease_ncl_v not in (None, 0)
+                and out.get(f"bonds_ncl_{suffix}") in (None, 0)
+                and lt_total_v not in (None, 0)
+            ):
+                dup_lt = int(loans_ncl_v) * 2 + int(lease_ncl_v)
+                corr_lt = int(loans_ncl_v) + int(lease_ncl_v)
+                if abs(int(lt_total_v) - dup_lt) <= COMP_MATCH_TOL_YEN:
+                    out[f"lt_total_{suffix}"] = corr_lt
+                    out[f"long_term_borrowings_{suffix}"] = corr_lt
+    except Exception:
+        pass
 
 
     # -----------------------------------------------------------------
@@ -6237,7 +7494,7 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
 
                         base_total = out.get(f"st_total_{suffix}") or out.get(f"short_term_borrowings_{suffix}")
                         comp_sum = 0
-                        for k in ("loans_cl", "bonds_cl", "cp_cl"):
+                        for k in ("loans_cl", "bonds_cl", "cp_cl", "fluidity_payables_cl", "railway_eq_payables_cl", "explicit_lt_debt_cl"):
                             v = out.get(f"{k}_{suffix}")
                             if isinstance(v, int) and v > 0:
                                 comp_sum += int(v)
@@ -6293,7 +7550,7 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
 
                         base_total = out.get(f"lt_total_{suffix}") or out.get(f"long_term_borrowings_{suffix}")
                         comp_sum = 0
-                        for k in ("loans_ncl", "bonds_ncl"):
+                        for k in ("loans_ncl", "bonds_ncl", "fluidity_payables_ncl", "railway_eq_payables_ncl", "explicit_lt_debt_ncl"):
                             v = out.get(f"{k}_{suffix}")
                             if isinstance(v, int) and v > 0:
                                 comp_sum += int(v)
@@ -6593,6 +7850,140 @@ def process_one_zip(zip_bytes: bytes, doc_kind: Optional[str] = None) -> Dict[st
         except Exception:
             pass
 
+    # -----------------------------------------------------------------
+    # General IFRS note rescue: "有利子負債及びその他の金融負債" -> "有利子負債の内訳"
+    #
+    # Why this must run late:
+    # - For issuers like 9201, broad XBRL totals and BS-rescue tables can still be too large.
+    # - This note table explicitly ends with "流動負債" / "非流動負債" totals for debt items only,
+    #   so it is more reliable than generic borrowings totals when the parser confirms the component rows.
+    # - Keep 4689 after its user-approved ticker exception only; do not let this generic rescue overwrite it.
+    #
+    # Why the trigger is narrow:
+    # - heading must say "有利子負債の内訳"
+    # - summary rows "流動負債" / "非流動負債" must exist
+    # - component rows on both short/long sides must also exist and agree within tolerance
+    # Removing these gates would risk capturing "(2) その他の金融負債の内訳" or mixed-liability tables.
+    # -----------------------------------------------------------------
+    if code4 != "4689" and html_candidates:
+        try:
+            def _apply_interest_bearing_note_pair(st_val, lt_val, suffix: str) -> bool:
+                if not (isinstance(st_val, int) and st_val > 0 and isinstance(lt_val, int) and lt_val > 0):
+                    return False
+                st_yen = int(st_val) * 1_000_000 if int(st_val) < 10_000_000 else int(st_val)
+                lt_yen = int(lt_val) * 1_000_000 if int(lt_val) < 10_000_000 else int(lt_val)
+                ta = out.get(f"total_assets_{suffix}")
+                if isinstance(ta, int) and ta > 0:
+                    if (st_yen > int(ta) * 2) or (lt_yen > int(ta) * 2):
+                        return False
+                out[f"short_term_borrowings_{suffix}"] = st_yen
+                out[f"long_term_borrowings_{suffix}"] = lt_yen
+                out[f"st_total_{suffix}"] = st_yen
+                out[f"lt_total_{suffix}"] = lt_yen
+                out[f"short_term_borrowings_sched_{suffix}"] = st_yen
+                out[f"long_term_borrowings_sched_{suffix}"] = lt_yen
+                return True
+
+            best_prior = None
+            best_current = None
+            best_prior_score = -1
+            best_current_score = -1
+            for h in html_candidates:
+                r = extract_interest_bearing_liabilities_note_pair(h)
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    sc = int(r.get("_score") or 0)
+                except Exception:
+                    sc = 0
+                if isinstance(r.get("prior"), int) and r.get("prior") > 0 and isinstance(r.get("prior_lt"), int) and r.get("prior_lt") > 0:
+                    if sc > best_prior_score:
+                        best_prior = r
+                        best_prior_score = sc
+                if isinstance(r.get("current"), int) and r.get("current") > 0 and isinstance(r.get("current_lt"), int) and r.get("current_lt") > 0:
+                    if sc > best_current_score:
+                        best_current = r
+                        best_current_score = sc
+
+            if isinstance(best_prior, dict):
+                _apply_interest_bearing_note_pair(best_prior.get("prior"), best_prior.get("prior_lt"), "prior")
+            if isinstance(best_current, dict):
+                _apply_interest_bearing_note_pair(best_current.get("current"), best_current.get("current_lt"), "current")
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------
+    # Strict NonConsolidatedMember override from explicit consolidated BS/note tables.
+    #
+    # Why this is separate from _apply_consolidated_bs_rescue_pair():
+    # - The older rescue is intentionally "undercount only" and rejects smaller replacements.
+    # - For issuers like 6645 / 6448 / 6702 prior, parent-company XBRL totals can be larger than the correct
+    #   consolidated debt totals, so the final fix must allow a *smaller* replacement.
+    # - That would be unsafe for generic tables, so this path is limited to the strict parser above, which only
+    #   accepts explicit consolidated debt/lease rows in the same table.
+    # Removing the debt_ctx_* NonConsolidatedMember guard here will reintroduce consolidated-table overreach.
+    # -----------------------------------------------------------------
+    if html_candidates:
+        try:
+            def _apply_strict_consolidated_noncon_pair(st_val, lt_val, suffix: str) -> bool:
+                if "nonconsolidated" not in str(out.get(f"debt_ctx_{suffix}") or "").lower():
+                    return False
+                if not (isinstance(st_val, int) and st_val > 0 and isinstance(lt_val, int) and lt_val > 0):
+                    return False
+                st_yen = int(st_val) * 1_000_000 if int(st_val) < 10_000_000 else int(st_val)
+                lt_yen = int(lt_val) * 1_000_000 if int(lt_val) < 10_000_000 else int(lt_val)
+                out[f"short_term_borrowings_{suffix}"] = st_yen
+                out[f"long_term_borrowings_{suffix}"] = lt_yen
+                out[f"st_total_{suffix}"] = st_yen
+                out[f"lt_total_{suffix}"] = lt_yen
+                out[f"short_term_borrowings_sched_{suffix}"] = st_yen
+                out[f"long_term_borrowings_sched_{suffix}"] = lt_yen
+                return True
+
+            # Choose the strongest strict-consolidated table across all html_candidates.
+            # Do NOT stop at the first match:
+            # - 6301 has an earlier partial table and a later correct table in the same filing.
+            # - 6471 can expose a weak "loan/bond only" table that must not override parent-XBRL totals.
+            # We therefore score every candidate and apply the best prior/current pair separately.
+            best_prior = None
+            best_current = None
+            best_prior_score = -1
+            best_current_score = -1
+            for h in html_candidates:
+                r = extract_general_debt_pair_from_consolidated_tables(h)
+                if not isinstance(r, dict):
+                    continue
+                sc = r.get("_score")
+                try:
+                    sc = int(sc)
+                except Exception:
+                    sc = 0
+                if isinstance(r.get("prior"), int) and r.get("prior") > 0 and isinstance(r.get("prior_lt"), int) and r.get("prior_lt") > 0:
+                    if sc > best_prior_score:
+                        best_prior = r
+                        best_prior_score = sc
+                if isinstance(r.get("current"), int) and r.get("current") > 0 and isinstance(r.get("current_lt"), int) and r.get("current_lt") > 0:
+                    if sc > best_current_score:
+                        best_current = r
+                        best_current_score = sc
+
+            applied_prior = False
+            applied_current = False
+            if isinstance(best_prior, dict):
+                applied_prior = _apply_strict_consolidated_noncon_pair(best_prior.get("prior"), best_prior.get("prior_lt"), "prior")
+            if isinstance(best_current, dict):
+                applied_current = _apply_strict_consolidated_noncon_pair(best_current.get("current"), best_current.get("current_lt"), "current")
+
+            if not (applied_prior and applied_current):
+                r = extract_general_debt_pair_from_consolidated_tables_zip(zip_bytes)
+                if isinstance(r, dict):
+                    if not applied_prior:
+                        _apply_strict_consolidated_noncon_pair(r.get("prior"), r.get("prior_lt"), "prior")
+                    if not applied_current:
+                        _apply_strict_consolidated_noncon_pair(r.get("current"), r.get("current_lt"), "current")
+        except Exception:
+            pass
+
     return out
 
 
@@ -6646,7 +8037,9 @@ def tdnet_fetch(session: requests.Session, url: str, timeout: int = 30) -> str:
 TDNET_GITHUB_MIRROR_REPO = "yukizi1113/tdnet"
 TDNET_GITHUB_MIRROR_TREE_API = f"https://api.github.com/repos/{TDNET_GITHUB_MIRROR_REPO}/git/trees/main?recursive=1"
 TDNET_GITHUB_MIRROR_RAW_BASE = f"https://raw.githubusercontent.com/{TDNET_GITHUB_MIRROR_REPO}/main/"
-TDNET_GITHUB_MIRROR_START_DATE = dt.date(2025, 12, 17)
+# User instruction (2026-03-06): mirror fallback must cover disclosures from mid-December 2025 onward.
+# Keep this start date aligned with the mirror coverage expectation.
+TDNET_GITHUB_MIRROR_START_DATE = dt.date(2025, 12, 15)
 _TDNET_GITHUB_TREE_CACHE: Optional[list] = None
 
 def _tdnet_github_tree(session: requests.Session) -> list:
@@ -6823,13 +8216,21 @@ def tdnet_iter_daily_xbrl_zip_links(session: requests.Session, day: dt.date, tar
             if not tds_raw:
                 continue
 
-            code4 = _tdnet_extract_code4_from_row_texts(tds_raw, target_tickers)
-            if not code4:
+            # TDNet list pages sometimes contain a giant wrapper <tr> that nests the whole page body.
+            # If we scan that row like a normal disclosure row, code extraction can match a target ticker
+            # anywhere in the page text and attach an unrelated ZIP/title. This previously produced bogus
+            # TDNet OTHER records (e.g. 6630) and then bogus period_end/WARNs downstream.
+            # Keep the guard narrow: actual disclosure rows are compact and start with HH:MM.
+            if len(tds_raw) > 12:
                 continue
 
             time_txt = tds_raw[0] if tds_raw else ""
-            if time_txt and not time_pat.match(time_txt):
-                pass
+            if not time_pat.match(time_txt):
+                continue
+
+            code4 = _tdnet_extract_code4_from_row_texts(tds_raw, target_tickers)
+            if not code4:
+                continue
 
             title_txt = ""
             for txt in tds_raw:
@@ -7220,6 +8621,11 @@ def _ensure_asr_for_period_end_if_needed(
                 d = parse_date_any(dstr) if dstr else None
                 if not d:
                     continue
+                if d != period_end:
+                    # Rescue scope is the requested FY-end only.
+                    # Importing the rescued filing's own prior row creates new old-period candidates that were
+                    # never requested and can surface unrelated WARNs on v7 historical columns.
+                    continue
                 rec_out = _build_edinet_record_from_extracted(
                     code4=code4,
                     desc=desc,
@@ -7231,7 +8637,18 @@ def _ensure_asr_for_period_end_if_needed(
                     period_end=d,
                 )
                 prev = store[code4].get(d)
-                if better_than(rec_out, prev):
+                if (
+                    suffix == "current"
+                    and d == period_end
+                    and isinstance(prev, dict)
+                    and prev.get("source") == "EDINET"
+                    and prev.get("doc_kind") == "ASR"
+                    and prev.get("suffix") == "prior"
+                ):
+                    # Rescue only the debt split from the original ASR current.
+                    # Replacing the full row reintroduces broad non-debt WARNs on v7 old FY-end cells.
+                    store[code4][d] = _merge_asr_rescued_current_debt(prev, rec_out)
+                elif better_than(rec_out, prev):
                     store[code4][d] = rec_out
 
             return  # 見つかったので終了
@@ -7372,7 +8789,18 @@ def scrape_edinet_bs(target_tickers: set[str], days_back: int, api_key: str, sle
 
                     if looks_like_fy_end:
                         prev2 = store[code4].get(d)
-                        if not (prev2 and prev2.get("doc_kind") == "ASR"):
+                        # Later ASR prior rows are not good enough here.
+                        # We want the original ASR current for that FY-end because:
+                        # - 8425/9021/9022 class cases can disclose a more complete debt schedule in the
+                        #   original filing than in the next year's ASR prior column.
+                        # - current outranks prior in record_priority, so once fetched it will replace safely.
+                        # Skipping rescue just because "an ASR exists" reintroduces stale-prior undercounts.
+                        # v173 guard: do NOT rescue every ASR prior blindly. If the later ASR prior already has a
+                        # stable debt/schedule pair, broad rescue creates unrelated old-period WARN churn.
+                        if (
+                            not (prev2 and prev2.get("doc_kind") == "ASR" and prev2.get("suffix") == "current")
+                            and _should_rescue_asr_current_for_period(prev2)
+                        ):
                             _ensure_asr_for_period_end_if_needed(store, code4=code4, period_end=d, api_key=api_key)
 
     return store
@@ -7516,36 +8944,191 @@ def collect_rows_and_tickers(
 
     return rows, tickers, row2ticker
 
-def _safe_save_workbook(wb, output_xlsx: str) -> str:
-    """Save workbook avoiding PermissionError/locks by auto-numbering.
-
-    If `output_xlsx` is locked (e.g., opened in Excel), save to `<base>_1.xlsx`, `<base>_2.xlsx`, ...
-    Returns the actually saved path.
-    """
-    base, ext = os.path.splitext(output_xlsx)
-
-    # First try the requested path.
+def _is_no_space_error(e: BaseException) -> bool:
+    '''Return True if the exception indicates a disk-full / no-space condition.'''
     try:
-        wb.save(output_xlsx)
-        return output_xlsx
-    except PermissionError:
+        if isinstance(e, OSError):
+            if getattr(e, 'errno', None) == errno.ENOSPC:
+                return True
+            # Windows: ERROR_DISK_FULL = 112
+            if getattr(e, 'winerror', None) == 112:
+                return True
+    except Exception:
         pass
-    except OSError:
-        # Some environments raise generic OSError on lock.
-        pass
+    s = (str(e) or '').lower()
+    return (
+        ('no space left' in s)
+        or ('disk full' in s)
+        or ('not enough space' in s)
+        or ('insufficient disk' in s)
+        or ('空き容量' in s)
+        or ('ディスク' in s and '不足' in s)
+    )
 
-    # Auto-numbered fallback.
+
+def _disk_free_bytes_for_path(p: str) -> int:
+    '''Return free bytes on the filesystem containing path p.'''
+    try:
+        target = p or '.'
+        if os.path.isdir(target):
+            d = target
+        else:
+            d = os.path.dirname(os.path.abspath(target)) or '.'
+        return int(shutil.disk_usage(d).free)
+    except Exception:
+        return 0
+
+
+def _format_bytes(n: int) -> str:
+    try:
+        n = int(n)
+    except Exception:
+        return str(n)
+    units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+    f = float(max(n, 0))
+    for u in units:
+        if f < 1024.0 or u == units[-1]:
+            if u == 'B':
+                return f"{int(f)}{u}"
+            return f"{f:.1f}{u}"
+        f /= 1024.0
+    return f"{f:.1f}PB"
+
+
+def _wait_for_disk_free(target_path: str, min_free_bytes: int, check_interval_sec: float) -> None:
+    '''Block until enough disk space is available.
+
+    This keeps the in-memory workbook alive, so the user can free disk space and still
+    obtain the output without re-running the whole scrape.
+    '''
+    try:
+        interval = float(check_interval_sec)
+    except Exception:
+        interval = 5.0
+    interval = max(0.5, interval)
+
+    last_msg_at = 0.0
+    while True:
+        free = _disk_free_bytes_for_path(target_path)
+        if free >= int(min_free_bytes):
+            return
+        now = time.time()
+        if now - last_msg_at >= 15.0:
+            try:
+                print(
+                    '[DISK-FULL] 空き容量不足のため保存を保留しています。'
+                    f' 保存先={target_path} free={_format_bytes(free)} required>={_format_bytes(int(min_free_bytes))}。'
+                    ' 不要ファイルを削除/移動すると自動で保存を再試行します。',
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+            last_msg_at = now
+        time.sleep(interval)
+
+
+def _safe_save_workbook(wb, output_xlsx: str) -> str:
+    '''Save workbook robustly.
+
+    - If target path is locked (e.g., opened in Excel), falls back to `<base>_1.xlsx`, `<base>_2.xlsx`, ...
+    - If disk is full, WAIT and RETRY (keeping `wb` in memory) instead of failing.
+    '''
+    base, ext = os.path.splitext(output_xlsx)
+    if not ext:
+        ext = '.xlsx'
+        output_xlsx = base + ext
+        base, _ = os.path.splitext(output_xlsx)
+
+    # Tunables (env-based; no CLI changes needed)
+    try:
+        min_free_mb = int((os.environ.get('BS_DISK_MIN_FREE_MB') or '512').strip())
+    except Exception:
+        min_free_mb = 512
+    try:
+        check_interval_sec = float((os.environ.get('BS_DISK_CHECK_INTERVAL_SEC') or '5').strip())
+    except Exception:
+        check_interval_sec = 5.0
+
+    # OpenPyXL needs headroom; keep a buffer to avoid repeated failures.
+    min_free_bytes = max(32 * 1024 * 1024, int(min_free_mb) * 1024 * 1024)
+
+    def _ensure_parent_dir(pth: str) -> None:
+        try:
+            d = os.path.dirname(os.path.abspath(pth))
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+
+    def _try_save(pth: str) -> bool:
+        '''Try saving to pth. True if saved, False if should try another path (locked/unwritable).'''
+        _ensure_parent_dir(pth)
+        while True:
+            try:
+                wb.save(pth)
+                return True
+            except PermissionError:
+                return False
+            except OSError as e:
+                if _is_no_space_error(e):
+                    _wait_for_disk_free(pth, min_free_bytes=min_free_bytes, check_interval_sec=check_interval_sec)
+                    continue
+                return False
+            except Exception as e:
+                if _is_no_space_error(e):
+                    _wait_for_disk_free(pth, min_free_bytes=min_free_bytes, check_interval_sec=check_interval_sec)
+                    continue
+                return False
+
+    if _try_save(output_xlsx):
+        return output_xlsx
+
     for i in range(1, 1000):
         alt = f"{base}_{i}{ext}"
-        try:
-            wb.save(alt)
+        if _try_save(alt):
             print(f"[save-fallback] {output_xlsx} を保存できなかったため {alt} に保存しました。")
             return alt
-        except Exception:
-            continue
 
     raise RuntimeError(f"保存失敗: {output_xlsx} も連番代替も保存できませんでした。Excel等で開いていないか確認してください。")
 
+
+def _safe_write_text_file(path: str, text: str) -> bool:
+    '''Write a text file; if disk is full, wait and retry. Returns True on success.'''
+    if not path:
+        return False
+
+    try:
+        min_free_mb = int((os.environ.get('BS_DISK_MIN_FREE_MB') or '512').strip())
+    except Exception:
+        min_free_mb = 512
+    try:
+        check_interval_sec = float((os.environ.get('BS_DISK_CHECK_INTERVAL_SEC') or '5').strip())
+    except Exception:
+        check_interval_sec = 5.0
+    min_free_bytes = max(8 * 1024 * 1024, int(min_free_mb) * 1024 * 1024)
+
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+
+    while True:
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(text or '')
+            return True
+        except OSError as e:
+            if _is_no_space_error(e):
+                _wait_for_disk_free(path, min_free_bytes=min_free_bytes, check_interval_sec=check_interval_sec)
+                continue
+            return False
+        except Exception as e:
+            if _is_no_space_error(e):
+                _wait_for_disk_free(path, min_free_bytes=min_free_bytes, check_interval_sec=check_interval_sec)
+                continue
+            return False
 
 def fill_excel_from_store(
     input_xlsx: str,
@@ -7761,23 +9344,50 @@ def fill_excel_from_store(
 
         excel_fy_end_month = infer_fy_end_month_from_excel(ws, row, date_cols)
 
+        rec_items = []
         for period_end, rec in recs.items():
             fy_end_month = rec.get("fy_end_month")
             if not isinstance(fy_end_month, int) or not (1 <= fy_end_month <= 12):
                 fy_end_month = excel_fy_end_month or 3
-
             fy, q = fiscal_year_and_quarter(period_end, fy_end_month)
+            rec_items.append((fy, q, period_end, rec))
+
+        # Process higher-priority sources first for each FYQ.
+        # This prevents a lower-priority TDNet record from emitting a stale WARN when an EDINET
+        # record for the same FYQ/field is also present and should be the only comparison target.
+        #
+        # If this ordering/guard is removed, same-FYQ duplicates such as 8253 can leave
+        # "TDNet WARN -> later EDINET overwrite" artifacts in the log even though the final cell
+        # value is correctly driven by EDINET.
+        rec_items.sort(
+            key=lambda x: (
+                x[0],
+                x[1],
+                record_priority(x[3]),
+                x[2],
+            ),
+            reverse=True,
+        )
+        handled_fyq_fields: set[tuple[int, int, str]] = set()
+        handled_fyq_dates: set[tuple[int, int]] = set()
+
+        for fy, q, period_end, rec in rec_items:
 
             # Fill date column (overwrite only if blank)
             dcol = date_cols.get((fy, q))
-            if dcol is not None:
+            if dcol is not None and (fy, q) not in handled_fyq_dates:
                 c = ws.cell(row, dcol)
                 if is_blank_cell(c.value):
                     c.value = f"{period_end.year}/{period_end.month:02d}"
                     c.fill = YELLOW
                     filled += 1
+                handled_fyq_dates.add((fy, q))
 
             for field, cmap in field_to_cols.items():
+                key_fyq_field = (fy, q, field)
+                if key_fyq_field in handled_fyq_fields:
+                    continue
+
                 col = cmap.get((fy, q))
                 if col is None:
                     continue
@@ -7785,6 +9395,7 @@ def fill_excel_from_store(
                 new_val = rec.get(field)
                 if new_val is None or new_val == "":
                     continue
+                handled_fyq_fields.add(key_fyq_field)
 
                 cell = ws.cell(row, col)
                 old_val = cell.value
@@ -7909,18 +9520,20 @@ def fill_excel_from_store(
 
 
     saved_path = _safe_save_workbook(wb, output_xlsx)
-
     # Write warnings to log file (avoid notebook truncation)
     if warn_log_path:
         try:
-            with open(warn_log_path, "w", encoding="utf-8") as f:
-                for w in warnings_list:
-                    f.write(w + "\n")
-                for w in info_list:
-                    f.write(w + "\n")
+            log_text = ''
+            if warnings_list or info_list:
+                log_text = (chr(10).join(list(warnings_list) + list(info_list)) + chr(10))
+            ok = _safe_write_text_file(warn_log_path, log_text)
+            if ok:
+                print(f"WARN log saved: {warn_log_path} (full list; notebook output may truncate)")
+            else:
+                warn(f"[WARN] WARNログを書き込めませんでした: {warn_log_path}")
         except Exception:
             pass
-        print(f"WARN log saved: {warn_log_path} (full list; notebook output may truncate)")
+
 
     print(
         f"Done. filled_cells={filled}, overwritten_cells={overwritten}, compared_existing={compared}, warnings={len(warnings_list)}, info={len(info_list)}, warning_cells={warn_cells}"
@@ -9636,12 +11249,19 @@ def scrape_tdnet_bs(target_tickers: set[str], days_back: int = 35, sleep_sec: fl
     # User-confirmed mirror locations:
     # - PDFs:  https://github.com/yukizi1113/tdnet/tree/main/tekigikaizi
     # - XBRL:  https://github.com/yukizi1113/tdnet/tree/main/XBRL
-    # We consume XBRL ZIPs from the GitHub mirror (>= 2025-12-17) and keep source='TDNet'
+    # We consume XBRL ZIPs from the GitHub mirror (>= 2025-12-15) and keep source='TDNet'
     # so existing source precedence / overwrite rules remain unchanged.
     try:
+        today_jst = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=9)).date()
+        mirror_days_back = int(days_back)
+        if today_jst >= TDNET_GITHUB_MIRROR_START_DATE:
+            # Do not tie mirror coverage to TDNet's short retention window.
+            # If this is removed, older-but-valid mirror records are silently missed.
+            full_span = (today_jst - TDNET_GITHUB_MIRROR_START_DATE).days + 1
+            mirror_days_back = max(mirror_days_back, int(full_span))
         tdnet_mirror = scrape_tdnet_bs_github_mirror(
             target_tickers=target_tickers,
-            days_back=days_back,
+            days_back=mirror_days_back,
             sleep_sec=min(float(sleep_sec), 0.25),
         )
         gh_added = 0
