@@ -14,7 +14,7 @@
 | 上書きポリシー | **空欄のみ**書き込み（既存値は保護） |
 | WARN 判定 | 既存値と取得値の差が `warn_tolerance`（デフォルト ±2 百万円）超で橙色マーク |
 | 対応銘柄コード | 4 桁数字（例: 9760）および英数混合（例: 142A）の新形式 |
-| Current Version | v26_182 |
+| Current Version | v26_272 |
 
 ---
 
@@ -209,6 +209,7 @@ EDINET_API_KEY=your_edinet_api_key_here
 
 | バージョン | 主な変更 |
 |-----------|---------|
+| v26_272 | Current-side debt extraction/rescue fixes through the v9/v10 follow-ups. Jupyter/Notebook runs no longer hard-fail when EDINET preflight sanity returns empty recent `documents` results; the run now warns and continues. |
 | v26_182 | Add line-oriented progress output for Colab/subprocess runs. Add `--progress-mode` (`auto` / `plain` / `off`) and keep `--only-tickers` subset execution visible at startup |
 | v26_181 | Exclude bank call money from short_term_borrowings. Add TDNet GitHub mirror fallback for XBRL ZIPs from 2025-12-15 onward. Tighten bond short/long rebucket guards to fix 9502 without regressing 8388 |
 | v26_165 | Include bank call money (`CallMoneyLiabilitiesBNK`) in short-term borrowings. Exclude sell-back and bond-lending collateral balances. |
