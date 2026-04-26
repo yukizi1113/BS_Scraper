@@ -212,8 +212,8 @@ def warn(msg: str) -> None:
 # =============================
 EDINET_API_KEY = os.environ.get("EDINET_API_KEY", "").strip()
 
-INPUT_XLSX = "データ取得_BS.xlsx"
-OUTPUT_XLSX = "データ取得_BS_EDINET優先_TDNet補完_テスト500社_v26_66.xlsx"
+INPUT_XLSX = "2026年度_データ取得_BS.xlsx"
+OUTPUT_XLSX = "2026年度_データ取得_BS_EDINET優先_TDNet補完_out_v26_324.xlsx"
 
 MAX_ROWS = 500   # テスト（上から500社）。全社は None
 
@@ -12493,6 +12493,10 @@ def build_col_map(ws, header_top: str) -> Dict[Tuple[int, int], int]:
     for col in range(1, ws.max_column + 1):
         if str(ws.cell(1, col).value).strip() != header_top:
             continue
+        # Workbook layout can shift horizontally between yearly templates
+        # (e.g. 2026 template removes the oldest 4 quarter-cells and slides the rest left).
+        # Keep the mapping header-driven so CP/DB/... columns follow the new template
+        # without any hard-coded column letters.
         fyq = parse_fy_q(ws.cell(2, col).value)
         if fyq:
             mp[fyq] = col

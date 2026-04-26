@@ -14,7 +14,7 @@
 | 上書きポリシー | **空欄のみ**書き込み（既存値は保護） |
 | WARN 判定 | 既存値と取得値の差が `warn_tolerance`（デフォルト ±2 百万円）超で橙色マーク |
 | 対応銘柄コード | 4 桁数字（例: 9760）および英数混合（例: 142A）の新形式 |
-| Current Version | v26_323 |
+| Current Version | v26_324 |
 
 ---
 
@@ -209,6 +209,7 @@ EDINET_API_KEY=your_edinet_api_key_here
 
 | バージョン | 主な変更 |
 |-----------|---------|
+| v26_324 | Switch the default workbook template to `2026年度_データ取得_BS.xlsx` / `2026年度_データ取得_BS_EDINET優先_TDNet補完_out_v26_324.xlsx`. Keep the column mapping header-driven so the 2026 template's 4-cell left shift is handled without hard-coded column rewrites. |
 | v26_323 | Rebuild from the v26_194 baseline with narrow debt-only backports. Suppress weak TDNet OTHER prior/current debt comparisons, fix current false WARNs such as 4494/5644/9247/9504/9602, and verify all 3595 tickers in 12 chunks with only held cases (3077/3192/6191) remaining in debt WARNs. |
 | v26_182 | Add line-oriented progress output for Colab/subprocess runs. Add `--progress-mode` (`auto` / `plain` / `off`) and keep `--only-tickers` subset execution visible at startup |
 | v26_181 | Exclude bank call money from short_term_borrowings. Add TDNet GitHub mirror fallback for XBRL ZIPs from 2025-12-15 onward. Tighten bond short/long rebucket guards to fix 9502 without regressing 8388 |
